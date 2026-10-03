@@ -1,18 +1,87 @@
 import os
+import re
 from datetime import datetime
 import pandas as pd
 import requests
 import streamlit as st
 
 API_BASE = "https://api.rentcast.io/v1"
+CACHE_TTL_SECONDS = 30 * 24 * 60 * 60  # 30 days
 
 st.set_page_config(page_title="NORVIM Deal Analyzer", page_icon="🏠", layout="wide")
 st.markdown("""
 <style>
-.stApp{background:#F6F2E9;color:#252A24}[data-testid="stSidebar"]{background:#ECE6D8}
-.block-container{padding-top:1.5rem}.k{letter-spacing:.15em;text-transform:uppercase;font-size:.78rem;color:#59634F}
-.t{font-family:Georgia,serif;font-size:2.3rem;line-height:1.05}.s{color:#666B62;margin-bottom:1rem}
-div[data-testid="stMetric"]{background:#FFFDF7;border:1px solid #D8D1C2;border-radius:10px;padding:12px}
+:root { color-scheme: light !important; }
+html, body, [data-testid="stAppViewContainer"], .stApp {
+    background: #F6F2E9 !important;
+    color: #252A24 !important;
+}
+[data-testid="stHeader"] { background: rgba(246,242,233,.96) !important; }
+[data-testid="stSidebar"] { background: #ECE6D8 !important; }
+[data-testid="stSidebar"] * { color: #252A24 !important; }
+.block-container { padding-top: 1.5rem; }
+.k { letter-spacing:.15em; text-transform:uppercase; font-size:.78rem; color:#59634F !important; }
+.t { font-family:Georgia,serif; font-size:2.3rem; line-height:1.05; color:#172019 !important; }
+.s { color:#666B62 !important; margin-bottom:1rem; }
+
+/* Inputs */
+.stTextInput input, .stNumberInput input, [data-baseweb="select"] > div {
+    background:#FFFFFF !important;
+    color:#252A24 !important;
+    border-color:#CFC7B8 !important;
+}
+.stTextInput label, .stNumberInput label, .stSelectbox label,
+[data-testid="stWidgetLabel"] p, .stCaptionContainer p, .stMarkdown p {
+    color:#4E554B !important;
+}
+
+/* Buttons */
+.stButton button, .stFormSubmitButton button, .stDownloadButton button {
+    background:#59634F !important;
+    color:#FFFFFF !important;
+    border:1px solid #59634F !important;
+}
+
+/* Tabs */
+button[data-baseweb="tab"] { color:#59634F !important; }
+button[data-baseweb="tab"][aria-selected="true"] { color:#252A24 !important; }
+
+/* Alerts */
+[data-testid="stAlert"] * { color:#252A24 !important; }
+
+/* Tables */
+[data-testid="stDataFrame"] { color:#252A24 !important; }
+
+/* Custom result cards: avoids Streamlit metric/theme conflicts */
+.norvim-card {
+    background:#FFFDF7;
+    border:1px solid #D8D1C2;
+    border-radius:12px;
+    padding:16px 16px 14px;
+    min-height:118px;
+}
+.norvim-card .label {
+    color:#697066 !important;
+    font-size:.82rem;
+    font-weight:600;
+    margin-bottom:10px;
+    line-height:1.25;
+}
+.norvim-card .value {
+    color:#172019 !important;
+    font-size:1.85rem;
+    font-weight:700;
+    line-height:1.08;
+    overflow-wrap:anywhere;
+}
+.norvim-card .sub {
+    color:#7A8077 !important;
+    font-size:.78rem;
+    margin-top:7px;
+}
+@media (max-width: 700px) {
+    .norvim-card .value { font-size:1.45rem; }
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -20,6 +89,16 @@ div[data-testid="stMetric"]{background:#FFFDF7;border:1px solid #D8D1C2;border-r
 def money(v):
     try: return f"${float(v):,.0f}"
     except: return "—"
+
+
+def result_card(label, value, sub=None):
+    safe_label = str(label or "")
+    safe_value = str(value or "—")
+    safe_sub = f'<div class="sub">{sub}</div>' if sub else ""
+    st.markdown(
+        f'<div class="norvim-card"><div class="label">{safe_label}</div><div class="value">{safe_value}</div>{safe_sub}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def get_key():
@@ -43,12 +122,25 @@ def api_get(path, params, key):
     return r.json()
 
 
-def analyze(address, key):
-    val = api_get("/avm/value", {"address":address,"lookupSubjectAttributes":"true","maxRadius":2,"daysOld":365,"compCount":15}, key)
-    rent = api_get("/avm/rent/long-term", {"address":address,"lookupSubjectAttributes":"true","maxRadius":3,"daysOld":365,"compCount":15}, key)
+def normalize_address(address):
+    """Create a stable cache key so small formatting/case changes reuse the same property snapshot."""
+    cleaned = re.sub(r"[^a-z0-9#]+", " ", address.strip().lower())
+    return " ".join(cleaned.split())
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def analyze_cached(address_key, key, _address_for_api):
+    """
+    Fetch one property snapshot and cache it for 30 days.
+    _address_for_api starts with an underscore so Streamlit does not hash formatting differences;
+    address_key is the normalized identity used for the cache key.
+    """
+    val = api_get("/avm/value", {"address":_address_for_api,"lookupSubjectAttributes":"true","maxRadius":2,"daysOld":365,"compCount":15}, key)
+    rent = api_get("/avm/rent/long-term", {"address":_address_for_api,"lookupSubjectAttributes":"true","maxRadius":3,"daysOld":365,"compCount":15}, key)
     subj = val.get("subjectProperty") or {}
     market = api_get("/markets", {"zipCode":subj.get("zipCode")}, key) if subj.get("zipCode") else {}
-    return val, rent, market
+    fetched_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    return val, rent, market, fetched_at
 
 
 def offer_math(strategy, arv, rent, rehab, closing, selling, holding, contingency, target_profit, assignment, refi_ltv, vacancy, opex, cap):
@@ -88,7 +180,7 @@ with st.sidebar:
         if entered:
             st.session_state["rentcast_api_key"] = entered; key = entered
     else: st.success("Property-data API connected")
-    st.caption("About 3 API requests per address.")
+    st.caption("About 3 API requests the first time. Re-running the same address reuses a saved 30-day snapshot and does not call RentCast again.")
     st.divider(); st.subheader("Deal assumptions")
     strategy = st.selectbox("Strategy", ["Flip","Wholesale","BRRRR","Rental"])
     rehab = st.number_input("Rehab budget", 0.0, value=40000.0, step=5000.0)
@@ -116,8 +208,17 @@ if submitted:
     else:
         with st.spinner("Pulling valuation, comps, rent and market data..."):
             try:
-                val, rent_data, market = analyze(address.strip(), key)
-                st.session_state["analysis"] = {"input":address.strip(),"valuation":val,"rent":rent_data,"market":market,"time":datetime.utcnow().isoformat(timespec="seconds")+"Z"}
+                address_clean = address.strip()
+                address_key = normalize_address(address_clean)
+                val, rent_data, market, fetched_at = analyze_cached(address_key, key, address_clean)
+                st.session_state["analysis"] = {
+                    "input": address_clean,
+                    "address_key": address_key,
+                    "valuation": val,
+                    "rent": rent_data,
+                    "market": market,
+                    "time": fetched_at,
+                }
             except Exception as e: st.error(str(e))
 
 A = st.session_state.get("analysis")
@@ -134,9 +235,12 @@ bits=[subj.get("propertyType"), f'{subj.get("bedrooms")} bd' if subj.get("bedroo
 st.caption(" · ".join([str(x) for x in bits if x]))
 
 m1,m2,m3,m4=st.columns(4)
-m1.metric("Estimated ARV", money(arv)); m2.metric("ARV range", f'{money(val.get("priceRangeLow"))} – {money(val.get("priceRangeHigh"))}')
-m3.metric("Estimated rent", f'{money(rent_m)}/mo'); m4.metric(label, money(ceiling))
+with m1: result_card("Estimated ARV", money(arv))
+with m2: result_card("ARV range", f'{money(val.get("priceRangeLow"))} – {money(val.get("priceRangeHigh"))}')
+with m3: result_card("Estimated rent", f'{money(rent_m)}/mo')
+with m4: result_card(label, money(ceiling))
 st.caption(note)
+st.info(f'Data snapshot saved: {A["time"]}. The same normalized address will reuse this snapshot for up to 30 days, avoiding another RentCast charge/request.')
 st.warning("Underwriting estimate only. Verify title, condition, flood risk, taxes, liens, repair scope and local comps before contracting.")
 
 tabs=st.tabs(["Deal","Sales comps","Area","Rental","Export"])
@@ -160,8 +264,10 @@ with tabs[2]:
     if not sd: st.info("No ZIP-level sale market statistics returned.")
     else:
         a1,a2,a3,a4=st.columns(4)
-        a1.metric("ZIP median price",money(sd.get("medianPrice"))); a2.metric("Average DOM",f'{sd.get("averageDaysOnMarket","—")} days')
-        a3.metric("Median DOM",f'{sd.get("medianDaysOnMarket","—")} days'); a4.metric("Listings",sd.get("totalListings","—"))
+        with a1: result_card("ZIP median price", money(sd.get("medianPrice")))
+        with a2: result_card("Average DOM", f'{sd.get("averageDaysOnMarket","—")} days')
+        with a3: result_card("Median DOM", f'{sd.get("medianDaysOnMarket","—")} days')
+        with a4: result_card("Listings", sd.get("totalListings","—"))
         hist=sd.get("history") or {}
         if isinstance(hist,dict) and hist:
             h=[]
@@ -170,10 +276,16 @@ with tabs[2]:
             if h: st.dataframe(pd.DataFrame(h).sort_values("Period").style.format({"Median Price":"${:,.0f}"},na_rep="—"),use_container_width=True,hide_index=True)
 
 with tabs[3]:
-    r1,r2,r3=st.columns(3); r1.metric("Estimated monthly rent",money(rent_m)); r2.metric("Rent range",f'{money(rent_data.get("rentRangeLow"))} – {money(rent_data.get("rentRangeHigh"))}'); r3.metric("Gross annual rent",money(rent_m*12))
+    r1,r2,r3=st.columns(3)
+    with r1: result_card("Estimated monthly rent", money(rent_m))
+    with r2: result_card("Rent range", f'{money(rent_data.get("rentRangeLow"))} – {money(rent_data.get("rentRangeHigh"))}')
+    with r3: result_card("Gross annual rent", money(rent_m*12))
     rd=market.get("rentalData") or {}
     if rd:
-        x1,x2,x3=st.columns(3); x1.metric("ZIP median rent",money(rd.get("medianRent"))); x2.metric("Average rental DOM",f'{rd.get("averageDaysOnMarket","—")} days'); x3.metric("Rental listings",rd.get("totalListings","—"))
+        x1,x2,x3=st.columns(3)
+        with x1: result_card("ZIP median rent", money(rd.get("medianRent")))
+        with x2: result_card("Average rental DOM", f'{rd.get("averageDaysOnMarket","—")} days')
+        with x3: result_card("Rental listings", rd.get("totalListings","—"))
 
 with tabs[4]:
     row={"analyzed_at_utc":A["time"],"address":subj.get("formattedAddress") or A["input"],"strategy":strategy,"property_type":subj.get("propertyType"),"beds":subj.get("bedrooms"),"baths":subj.get("bathrooms"),"sqft":subj.get("squareFootage"),"year_built":subj.get("yearBuilt"),"arv":arv,"arv_low":val.get("priceRangeLow"),"arv_high":val.get("priceRangeHigh"),"rent_monthly":rent_m,"rehab":rehab,"offer_ceiling":ceiling,"zip_code":subj.get("zipCode")}
