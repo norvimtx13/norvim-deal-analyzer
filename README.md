@@ -1,37 +1,63 @@
-# NORVIM Deal Analyzer — MVP
+# NORVIM DealFinder 2.0
 
-A Streamlit web app for evaluating listed or off-market residential properties.
+A Houston-first property acquisition operating system built in Streamlit.
 
-## Included
-- Address lookup
-- ARV/value estimate and sales comps
-- Long-term rent estimate
-- ZIP-level sale/rental market statistics
-- Average and median days on market
-- Flip, wholesale, BRRRR and rental offer calculations
-- Comp map when coordinates are available
-- CSV deal-summary export
+## What changed in 2.0
 
-The MVP uses the RentCast API and normally makes about 3 API requests per analyzed address.
+### DealFinder
+Every property is evaluated across:
+- Flip
+- Wholesale
+- BRRRR
+- Rental
 
-## Run locally
-1. Install Python 3.11+.
-2. Run `pip install -r requirements.txt`.
-3. Create `.streamlit/secrets.toml` containing:
-   `RENTCAST_API_KEY = "your_key_here"`
-4. Run `streamlit run app.py`.
+The app no longer assumes the user's preferred strategy is automatically the best modeled fit. It shows whether that strategy meets the user's thresholds and identifies the strongest alternative model when it does not.
 
-## Put it online
-1. Create a GitHub repository such as `norvim-deal-analyzer`.
-2. Upload this project folder's files.
-3. Go to https://share.streamlit.io and connect GitHub.
-4. Click **Create app**, select the repo, and use `app.py` as the entrypoint.
-5. In **Advanced settings → Secrets**, add:
-   `RENTCAST_API_KEY = "your_key_here"`
-6. Deploy. Streamlit gives you a shareable `streamlit.app` URL.
+### Offer Lab
+Move the purchase-price slider without making new property-data requests. It recalculates:
+- flip profit
+- wholesale spread
+- BRRRR cash flow / cash left
+- rental cash flow
+- strongest modeled strategy
 
-## Security
-Never commit your real API key to GitHub. The `.gitignore` file blocks `.streamlit/secrets.toml`.
+### Neighborhood Intelligence
+Separate from RentCast:
+- FEMA National Flood Hazard Layer point screening
+- Houston 311 recent service-request activity within 0.5 mile
+- Houston PlatTracker applications/final plats within 1 mile
+- optional U.S. Census ACS ZIP profile with a free Census key
+- research shortcuts for exact-address search, development search, Houston permits and FEMA maps
 
-## Suggested V2
-Private login, persistent deal database, manual comp include/exclude, FEMA flood data, Harris County/HCAD links, repair estimator, branded PDF reports, deal pipeline, and driving-for-dollars workflow.
+Public GIS services can be temporarily unavailable; the app fails gracefully.
+
+### Permanent cache + CRM
+Optional Supabase integration adds:
+- persistent property snapshots
+- persistent RentCast usage tracking
+- saved underwriting runs
+- acquisition pipeline / notes / follow-up dates
+
+Run `supabase_schema.sql` and add Supabase credentials to Streamlit Secrets.
+
+### RentCast usage meter
+Tracks successful RentCast HTTP 200 responses made by the app.
+This is an app-side estimate, not the provider's official billing meter.
+Use `RENTCAST_USAGE_OFFSET` to account for requests made before DealFinder started tracking.
+
+## Important underwriting notes
+
+- Strategy statuses mean **meets / misses the thresholds entered in the app**.
+- They are not guarantees and are not a substitute for inspection, title, lender, appraisal, insurance, tax, flood, legal or contractor verification.
+- Acquisition closing costs in 2.0 are modeled as a percentage of the **purchase price**, rather than ARV.
+- Active asking prices are not the same as closed-sale evidence.
+- Public-data layers may have different update cadences and geographic coverage.
+
+## Files
+
+- `app.py` — application
+- `requirements.txt` — Python dependencies
+- `.streamlit/config.toml` — theme
+- `.streamlit/secrets.example.toml` — secrets template
+- `supabase_schema.sql` — permanent cache / CRM schema
+- `DEPLOY_V2.md` — deployment instructions

@@ -1,8 +1,8 @@
 import os
 import re
 import math
-from datetime import datetime
-from urllib.parse import quote
+from datetime import datetime, timezone
+from urllib.parse import quote, quote_plus
 import pandas as pd
 import requests
 import streamlit as st
@@ -11,7 +11,7 @@ import pydeck as pdk
 API_BASE = "https://api.rentcast.io/v1"
 CACHE_TTL_SECONDS = 30 * 24 * 60 * 60  # 30 days
 
-st.set_page_config(page_title="NORVIM Deal Analyzer", page_icon="🏠", layout="wide")
+st.set_page_config(page_title="NORVIM DealFinder 2.0", page_icon="🏠", layout="wide")
 st.markdown("""
 <style>
 :root { color-scheme: light !important; }
@@ -138,6 +138,36 @@ button[data-baseweb="tab"][aria-selected="true"] { color:#252A24 !important; }
     font-size:.9rem;
     line-height:1.4;
 }
+
+.map-legend {display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin:8px 0 12px;padding:10px 12px;background:#FFFDF7;border:1px solid #D8D1C2;border-radius:10px;}
+.map-legend-item {display:flex;align-items:center;gap:7px;font-size:.88rem;color:#394039 !important;}
+.map-dot {width:12px;height:12px;border-radius:50%;display:inline-block;border:1px solid rgba(255,255,255,.95);box-shadow:0 0 0 1px rgba(0,0,0,.12);}
+.map-dot.subject {background:rgb(89,99,79);}
+.map-dot.sale {background:rgb(61,120,184);}
+.map-dot.active {background:rgb(214,137,63);}
+.map-dot.comp {background:rgb(126,92,120);}
+
+.strategy-card {
+    background:#FFFDF7;
+    border:1px solid #D8D1C2;
+    border-radius:14px;
+    padding:15px 16px;
+    min-height:180px;
+    margin-bottom:10px;
+}
+.strategy-card.good { border-left:6px solid #6F8A63; }
+.strategy-card.warn { border-left:6px solid #C89D4A; }
+.strategy-card.bad { border-left:6px solid #B87569; }
+.strategy-card .strategy-name {font-family:Georgia,serif;font-size:1.25rem;font-weight:700;color:#172019 !important;}
+.strategy-card .strategy-status {font-size:.85rem;font-weight:700;margin:5px 0 8px;color:#59634F !important;}
+.strategy-card .strategy-copy {font-size:.88rem;line-height:1.45;color:#596058 !important;}
+.source-pill {display:inline-block;padding:4px 8px;border-radius:999px;border:1px solid #D8D1C2;background:#FFFDF7;font-size:.76rem;margin:2px 3px 2px 0;color:#596058 !important;}
+.big-decision {
+    padding:18px 20px;border-radius:15px;background:#FFFDF7;border:1px solid #D8D1C2;margin:6px 0 18px;
+}
+.big-decision .title {font-family:Georgia,serif;font-size:1.65rem;font-weight:700;color:#172019 !important;}
+.big-decision .copy {margin-top:5px;color:#596058 !important;line-height:1.45;}
+
 @media (max-width: 700px) {
     .norvim-card .value { font-size:1.45rem; }
 }
@@ -160,6 +190,459 @@ def result_card(label, value, sub=None):
     )
 
 
+
+def get_setting(name, default=None):
+    try:
+        if name in st.secrets:
+            return st.secrets[name]
+    except Exception:
+        pass
+    return os.getenv(name, default)
+
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def supabase_config():
+    url = str(get_setting("SUPABASE_URL", "") or "").strip().rstrip("/")
+    service_key = str(get_setting("SUPABASE_SERVICE_ROLE_KEY", "") or "").strip()
+    org_id = str(get_setting("NORVIM_ORG_ID", "norvim") or "norvim").strip()
+    return url, service_key, org_id
+
+
+def db_enabled():
+    url, key, _ = supabase_config()
+    return bool(url and key)
+
+
+def db_request(method, table, params=None, payload=None, prefer=None, timeout=20):
+    url, key, _ = supabase_config()
+    if not url or not key:
+        raise RuntimeError("Supabase is not configured.")
+    headers = {
+        "apikey": key,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    if key.startswith("eyJ"):
+        headers["Authorization"] = f"Bearer {key}"
+    if prefer:
+        headers["Prefer"] = prefer
+    r = requests.request(
+        method,
+        f"{url}/rest/v1/{table}",
+        params=params or {},
+        json=payload,
+        headers=headers,
+        timeout=timeout,
+    )
+    if not r.ok:
+        raise RuntimeError(f"Database request failed ({r.status_code}): {r.text[:300]}")
+    if not r.text.strip():
+        return []
+    try:
+        return r.json()
+    except Exception:
+        return []
+
+
+def db_get_cached_snapshot(address_key, max_age_days=30):
+    if not db_enabled():
+        return None
+    _, _, org_id = supabase_config()
+    try:
+        rows = db_request(
+            "GET",
+            "analysis_snapshots",
+            params={
+                "select": "snapshot,fetched_at",
+                "org_id": f"eq.{org_id}",
+                "normalized_address": f"eq.{address_key}",
+                "order": "fetched_at.desc",
+                "limit": 1,
+            },
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        fetched_at = row.get("fetched_at")
+        if not fetched_at:
+            return None
+        dt = datetime.fromisoformat(str(fetched_at).replace("Z", "+00:00"))
+        age_days = (datetime.now(timezone.utc) - dt).total_seconds() / 86400
+        if age_days > max_age_days:
+            return None
+        snap = row.get("snapshot") or {}
+        if not isinstance(snap, dict):
+            return None
+        snap["_db_cache_age_days"] = age_days
+        return snap
+    except Exception as e:
+        st.session_state["db_last_error"] = str(e)
+        return None
+
+
+def db_save_snapshot(address_key, address, snapshot):
+    if not db_enabled():
+        return False
+    _, _, org_id = supabase_config()
+    try:
+        db_request(
+            "POST",
+            "analysis_snapshots",
+            payload={
+                "org_id": org_id,
+                "normalized_address": address_key,
+                "address": address,
+                "snapshot": snapshot,
+                "fetched_at": snapshot.get("time") or utc_now_iso(),
+            },
+            prefer="return=minimal",
+        )
+        return True
+    except Exception as e:
+        st.session_state["db_last_error"] = str(e)
+        return False
+
+
+def db_upsert_property(subject, property_record, address_key, fallback_address):
+    if not db_enabled():
+        return None
+    _, _, org_id = supabase_config()
+    payload = {
+        "org_id": org_id,
+        "normalized_address": address_key,
+        "rentcast_id": property_record.get("id") or subject.get("id"),
+        "address": subject.get("formattedAddress") or property_record.get("formattedAddress") or fallback_address,
+        "city": subject.get("city") or property_record.get("city"),
+        "state": subject.get("state") or property_record.get("state"),
+        "zip_code": str(subject.get("zipCode") or property_record.get("zipCode") or "") or None,
+        "property_type": subject.get("propertyType") or property_record.get("propertyType"),
+        "bedrooms": subject.get("bedrooms") or property_record.get("bedrooms"),
+        "bathrooms": subject.get("bathrooms") or property_record.get("bathrooms"),
+        "square_footage": subject.get("squareFootage") or property_record.get("squareFootage"),
+        "latitude": subject.get("latitude") or property_record.get("latitude"),
+        "longitude": subject.get("longitude") or property_record.get("longitude"),
+        "updated_at": utc_now_iso(),
+    }
+    try:
+        rows = db_request(
+            "POST",
+            "properties",
+            params={"on_conflict": "org_id,normalized_address"},
+            payload=payload,
+            prefer="resolution=merge-duplicates,return=representation",
+        )
+        return rows[0] if rows else None
+    except Exception as e:
+        st.session_state["db_last_error"] = str(e)
+        return None
+
+
+def db_save_underwriting(property_id, address_key, selected_strategy, purchase_price, strategy_results, assumptions):
+    if not db_enabled() or not property_id:
+        return False
+    _, _, org_id = supabase_config()
+    try:
+        db_request(
+            "POST",
+            "underwriting_runs",
+            payload={
+                "org_id": org_id,
+                "property_id": property_id,
+                "normalized_address": address_key,
+                "selected_strategy": selected_strategy,
+                "purchase_price": purchase_price,
+                "strategy_results": strategy_results,
+                "assumptions": assumptions,
+                "created_at": utc_now_iso(),
+            },
+            prefer="return=minimal",
+        )
+        return True
+    except Exception as e:
+        st.session_state["db_last_error"] = str(e)
+        return False
+
+
+def db_save_lead(property_id, lead):
+    if not db_enabled() or not property_id:
+        return False
+    _, _, org_id = supabase_config()
+    payload = {
+        "org_id": org_id,
+        "property_id": property_id,
+        "status": lead.get("status"),
+        "lead_source": lead.get("lead_source"),
+        "seller_name": lead.get("seller_name"),
+        "seller_phone": lead.get("seller_phone"),
+        "seller_email": lead.get("seller_email"),
+        "partner": lead.get("partner"),
+        "preferred_strategy": lead.get("preferred_strategy"),
+        "seller_ask": lead.get("seller_ask"),
+        "offer_amount": lead.get("offer_amount"),
+        "follow_up_date": lead.get("follow_up_date"),
+        "notes": lead.get("notes"),
+        "updated_at": utc_now_iso(),
+    }
+    try:
+        db_request(
+            "POST",
+            "leads",
+            params={"on_conflict": "org_id,property_id"},
+            payload=payload,
+            prefer="resolution=merge-duplicates,return=minimal",
+        )
+        return True
+    except Exception as e:
+        st.session_state["db_last_error"] = str(e)
+        return False
+
+
+def db_get_pipeline():
+    if not db_enabled():
+        return []
+    _, _, org_id = supabase_config()
+    try:
+        return db_request(
+            "GET",
+            "lead_pipeline",
+            params={
+                "select": "*",
+                "org_id": f"eq.{org_id}",
+                "order": "updated_at.desc",
+                "limit": 250,
+            },
+        )
+    except Exception as e:
+        st.session_state["db_last_error"] = str(e)
+        return []
+
+
+def record_api_usage(endpoint, address_key=None):
+    # Track only successful RentCast HTTP 200 responses.
+    st.session_state["rentcast_usage_session"] = int(st.session_state.get("rentcast_usage_session", 0)) + 1
+    if not db_enabled():
+        return
+    _, _, org_id = supabase_config()
+    try:
+        db_request(
+            "POST",
+            "api_usage",
+            payload={
+                "org_id": org_id,
+                "provider": "RentCast",
+                "endpoint": endpoint,
+                "normalized_address": address_key,
+                "occurred_at": utc_now_iso(),
+            },
+            prefer="return=minimal",
+        )
+    except Exception:
+        pass
+
+
+def db_monthly_api_usage():
+    offset = int(float(get_setting("RENTCAST_USAGE_OFFSET", 0) or 0))
+    if not db_enabled():
+        return offset + int(st.session_state.get("rentcast_usage_session", 0))
+    _, _, org_id = supabase_config()
+    now = datetime.now(timezone.utc)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat().replace("+00:00", "Z")
+    try:
+        rows = db_request(
+            "GET",
+            "api_usage",
+            params={
+                "select": "id",
+                "org_id": f"eq.{org_id}",
+                "provider": "eq.RentCast",
+                "occurred_at": f"gte.{month_start}",
+                "limit": 5000,
+            },
+        )
+        return offset + len(rows)
+    except Exception:
+        return offset + int(st.session_state.get("rentcast_usage_session", 0))
+
+
+def safe_public_get(url, params=None, timeout=18):
+    try:
+        r = requests.get(url, params=params or {}, timeout=timeout, headers={"User-Agent": "NORVIM-DealFinder/2.0"})
+        if not r.ok:
+            return {"_error": f"HTTP {r.status_code}"}
+        data = r.json()
+        if isinstance(data, dict) and data.get("error"):
+            return {"_error": str(data.get("error"))}
+        return data
+    except Exception as e:
+        return {"_error": str(e)}
+
+
+def arcgis_nearby_query(url, lat, lon, distance_miles, out_fields="*", limit=250):
+    if lat is None or lon is None:
+        return []
+    payload = safe_public_get(
+        url,
+        {
+            "where": "1=1",
+            "geometry": f"{lon},{lat}",
+            "geometryType": "esriGeometryPoint",
+            "inSR": 4326,
+            "spatialRel": "esriSpatialRelIntersects",
+            "distance": round(float(distance_miles) * 1609.344, 1),
+            "units": "esriSRUnit_Meter",
+            "outFields": out_fields,
+            "returnGeometry": "false",
+            "resultRecordCount": int(limit),
+            "f": "json",
+        },
+    )
+    if not isinstance(payload, dict) or payload.get("_error"):
+        return []
+    return payload.get("features") or []
+
+
+def _first_attr(attrs, candidates):
+    if not isinstance(attrs, dict):
+        return None
+    normalized = {str(k).lower().replace("_", "").replace(" ", ""): v for k, v in attrs.items()}
+    for candidate in candidates:
+        c = candidate.lower().replace("_", "").replace(" ", "")
+        if c in normalized and normalized[c] not in (None, ""):
+            return normalized[c]
+    for key, value in normalized.items():
+        for candidate in candidates:
+            c = candidate.lower().replace("_", "").replace(" ", "")
+            if c in key and value not in (None, ""):
+                return value
+    return None
+
+
+def summarize_311(features):
+    categories = {}
+    rows = []
+    for feature in features or []:
+        attrs = feature.get("attributes") or {}
+        category = _first_attr(attrs, ["srtype", "servicerequesttype", "type", "problem", "subject", "category"]) or "Other / unknown"
+        status = _first_attr(attrs, ["status", "srstatus", "case_status"])
+        case_no = _first_attr(attrs, ["casenumber", "case_no", "srnumber", "servicerequestnumber"])
+        address = _first_attr(attrs, ["address", "incidentaddress", "streetaddress", "location"])
+        categories[str(category)] = categories.get(str(category), 0) + 1
+        rows.append({"Category": category, "Status": status, "Case": case_no, "Location": address})
+    top = sorted(categories.items(), key=lambda x: x[1], reverse=True)
+    return top, pd.DataFrame(rows)
+
+
+def summarize_plats(features):
+    rows = []
+    for feature in features or []:
+        attrs = feature.get("attributes") or {}
+        rows.append({
+            "Subdivision": _first_attr(attrs, ["SubdivisionName", "DocName"]),
+            "Application": _first_attr(attrs, ["AppNo", "AppId"]),
+            "Status": _first_attr(attrs, ["AppStatus"]),
+            "Type": _first_attr(attrs, ["AppCode"]),
+            "Review Cycle": _first_attr(attrs, ["ReviewCycle"]),
+            "Upload Date": _first_attr(attrs, ["UploadDate"]),
+        })
+    return pd.DataFrame(rows)
+
+
+def census_zip_profile(zip_code, census_key):
+    if not zip_code or not census_key:
+        return {}
+    vars_ = [
+        "NAME",
+        "B01003_001E",  # population
+        "B19013_001E",  # median household income
+        "B25002_001E",  # housing units
+        "B25002_002E",  # occupied
+        "B25002_003E",  # vacant
+        "B25003_001E",  # occupied tenure total
+        "B25003_002E",  # owner occupied
+        "B25003_003E",  # renter occupied
+        "B25064_001E",  # median gross rent
+        "B25077_001E",  # median home value
+        "B25035_001E",  # median year built
+    ]
+    data = safe_public_get(
+        "https://api.census.gov/data/2024/acs/acs5",
+        {
+            "get": ",".join(vars_),
+            "for": f"zip code tabulation area:{zip_code}",
+            "key": census_key,
+        },
+    )
+    if not isinstance(data, list) or len(data) < 2:
+        return {}
+    headers, values = data[0], data[1]
+    row = dict(zip(headers, values))
+    def num(key):
+        try:
+            v = float(row.get(key))
+            return None if v < 0 else v
+        except Exception:
+            return None
+    housing = num("B25002_001E")
+    vacant = num("B25002_003E")
+    tenure = num("B25003_001E")
+    owner = num("B25003_002E")
+    renter = num("B25003_003E")
+    return {
+        "name": row.get("NAME"),
+        "population": num("B01003_001E"),
+        "median_household_income": num("B19013_001E"),
+        "housing_units": housing,
+        "vacancy_rate": (vacant / housing) if housing else None,
+        "owner_rate": (owner / tenure) if tenure else None,
+        "renter_rate": (renter / tenure) if tenure else None,
+        "median_gross_rent": num("B25064_001E"),
+        "median_home_value": num("B25077_001E"),
+        "median_year_built": num("B25035_001E"),
+    }
+
+
+@st.cache_data(ttl=7 * 24 * 60 * 60, show_spinner=False)
+def public_intelligence_cached(address_key, lat, lon, zip_code, census_key):
+    result = {"flood": {}, "311": [], "plat_apps": [], "final_plats": [], "census": {}, "fetched_at": utc_now_iso()}
+    if lat is None or lon is None:
+        return result
+
+    flood = safe_public_get(
+        "https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer/28/query",
+        {
+            "where": "1=1",
+            "geometry": f"{lon},{lat}",
+            "geometryType": "esriGeometryPoint",
+            "inSR": 4326,
+            "spatialRel": "esriSpatialRelIntersects",
+            "outFields": "FLD_ZONE,ZONE_SUBTY,SFHA_TF,STATIC_BFE",
+            "returnGeometry": "false",
+            "f": "json",
+        },
+    )
+    if isinstance(flood, dict) and not flood.get("_error"):
+        feats = flood.get("features") or []
+        result["flood"] = (feats[0].get("attributes") or {}) if feats else {}
+
+    result["311"] = arcgis_nearby_query(
+        "https://mycity2.houstontx.gov/pubgis01/rest/services/311/Houston311_RecentServiceRequests/FeatureServer/4/query",
+        lat, lon, 0.5, "*", 500
+    )
+    result["plat_apps"] = arcgis_nearby_query(
+        "https://mycity2.houstontx.gov/geoplat01/rest/services/PlatTracker/PT365_PLAT_MAPPING/MapServer/1/query",
+        lat, lon, 1.0, "DocName,AppId,UploadDate,AppNo,ReviewCycle,AppCode,AppStatus,SubdivisionName", 250
+    )
+    result["final_plats"] = arcgis_nearby_query(
+        "https://mycity2.houstontx.gov/geoplat01/rest/services/PlatTracker/PT365_PLAT_MAPPING/MapServer/0/query",
+        lat, lon, 1.0, "DocName,AppId,UploadDate", 250
+    )
+    if census_key:
+        result["census"] = census_zip_profile(zip_code, census_key)
+    return result
+
 def get_key():
     try:
         if "RENTCAST_API_KEY" in st.secrets:
@@ -169,7 +652,7 @@ def get_key():
     return os.getenv("RENTCAST_API_KEY") or st.session_state.get("rentcast_api_key", "")
 
 
-def api_get(path, params, key):
+def api_get(path, params, key, address_key=None):
     r = requests.get(f"{API_BASE}{path}", params=params,
                      headers={"Accept":"application/json","X-Api-Key":key}, timeout=30)
     if r.status_code == 401: raise RuntimeError("RentCast rejected the API key.")
@@ -178,11 +661,12 @@ def api_get(path, params, key):
         try: detail = r.json().get("message", "")
         except: detail = r.text[:250]
         raise RuntimeError(f"Property-data request failed ({r.status_code}). {detail}")
+    record_api_usage(path, address_key)
     return r.json()
 
 
 
-def api_get_optional(path, params, key):
+def api_get_optional(path, params, key, address_key=None):
     """Same as api_get, but return an empty object if a record simply does not exist."""
     r = requests.get(
         f"{API_BASE}{path}",
@@ -202,6 +686,7 @@ def api_get_optional(path, params, key):
         except:
             detail = r.text[:250]
         raise RuntimeError(f"Property-data request failed ({r.status_code}). {detail}")
+    record_api_usage(path, address_key)
     return r.json()
 
 
@@ -224,13 +709,13 @@ def analyze_cached(address_key, key, _address_for_api):
     _address_for_api starts with an underscore so Streamlit does not hash formatting differences;
     address_key is the normalized identity used for the cache key.
     """
-    val = api_get("/avm/value", {"address":_address_for_api,"lookupSubjectAttributes":"true","maxRadius":2,"daysOld":365,"compCount":15}, key)
-    rent = api_get("/avm/rent/long-term", {"address":_address_for_api,"lookupSubjectAttributes":"true","maxRadius":3,"daysOld":365,"compCount":15}, key)
+    val = api_get("/avm/value", {"address":_address_for_api,"lookupSubjectAttributes":"true","maxRadius":2,"daysOld":365,"compCount":15}, key, address_key)
+    rent = api_get("/avm/rent/long-term", {"address":_address_for_api,"lookupSubjectAttributes":"true","maxRadius":3,"daysOld":365,"compCount":15}, key, address_key)
     subj = val.get("subjectProperty") or {}
-    market = api_get("/markets", {"zipCode":subj.get("zipCode"), "dataType":"All", "historyRange":12}, key) if subj.get("zipCode") else {}
+    market = api_get("/markets", {"zipCode":subj.get("zipCode"), "dataType":"All", "historyRange":12}, key, address_key) if subj.get("zipCode") else {}
 
     # Public-record profile: owner, tax history, sale history, HOA, subdivision, features, etc.
-    property_payload = api_get_optional("/properties", {"address":_address_for_api}, key)
+    property_payload = api_get_optional("/properties", {"address":_address_for_api}, key, address_key)
     property_record = first_record(property_payload)
 
     # Exact sale-listing record (if one exists). The listing record contains current status,
@@ -242,6 +727,7 @@ def analyze_cached(address_key, key, _address_for_api):
             f"/listings/sale/{quote(str(property_id), safe='')}",
             {},
             key,
+            address_key,
         )
 
     fetched_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
@@ -284,8 +770,8 @@ def neighborhood_cached(address_key, key, _address_for_api, property_type):
         params_sales["propertyType"] = property_type
         params_active["propertyType"] = property_type
 
-    recent_sales = api_get("/properties", params_sales, key)
-    active_listings = api_get("/listings/sale", params_active, key)
+    recent_sales = api_get("/properties", params_sales, key, address_key)
+    active_listings = api_get("/listings/sale", params_active, key, address_key)
     fetched_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     return recent_sales or [], active_listings or [], fetched_at
 
@@ -341,40 +827,121 @@ def active_listing_df(records, subject_lat=None, subject_lon=None):
     return df
 
 
-def neighborhood_map_rows(subj, sales_df, active_df, comps_df):
+
+def neighborhood_map_rows(
+    subj,
+    sales_df,
+    active_df,
+    comps_df,
+    valuation=None,
+    rent_data=None,
+    property_record=None,
+):
+    valuation = valuation or {}
+    rent_data = rent_data or {}
+    property_record = property_record or {}
+
     rows = []
     slat, slon = subj.get("latitude"), subj.get("longitude")
+
     if slat is not None and slon is not None:
         rows.append({
-            "lat": slat, "lon": slon, "type": "Subject property",
-            "address": subj.get("formattedAddress") or "Subject property",
-            "price": None, "dom": None, "detail": "Property being analyzed",
+            "lat": slat,
+            "lon": slon,
+            "type": "Subject property",
+            "address": subj.get("formattedAddress") or property_record.get("formattedAddress") or "Subject property",
+            "zip": subj.get("zipCode") or property_record.get("zipCode"),
+            "price": valuation.get("price"),
+            "price_label": "Estimated ARV",
+            "rent": rent_data.get("rent"),
+            "beds": subj.get("bedrooms") or property_record.get("bedrooms"),
+            "baths": subj.get("bathrooms") or property_record.get("bathrooms"),
+            "sqft": subj.get("squareFootage") or property_record.get("squareFootage"),
+            "year_built": subj.get("yearBuilt") or property_record.get("yearBuilt"),
+            "dom": None,
+            "date": None,
+            "distance": 0.0,
+            "detail": "Property being analyzed",
         })
+
     for _, r in sales_df.dropna(subset=["Latitude","Longitude"]).iterrows() if not sales_df.empty else []:
         rows.append({
-            "lat": r["Latitude"], "lon": r["Longitude"], "type": "Recent sale",
-            "address": r.get("Address"), "price": r.get("Sold Price"), "dom": None,
-            "detail": f"Sold {r.get('Sale Date') or 'date unavailable'}",
+            "lat": r["Latitude"],
+            "lon": r["Longitude"],
+            "type": "Recent sale",
+            "address": r.get("Address"),
+            "zip": r.get("ZIP"),
+            "price": r.get("Sold Price"),
+            "price_label": "Sold price",
+            "rent": None,
+            "beds": r.get("Beds"),
+            "baths": r.get("Baths"),
+            "sqft": r.get("Sq Ft"),
+            "year_built": None,
+            "dom": None,
+            "date": r.get("Sale Date"),
+            "distance": r.get("Distance (mi)"),
+            "detail": f"Recorded sale {r.get('Sale Date') or 'date unavailable'}",
         })
+
     for _, r in active_df.dropna(subset=["Latitude","Longitude"]).iterrows() if not active_df.empty else []:
         rows.append({
-            "lat": r["Latitude"], "lon": r["Longitude"], "type": "Active listing",
-            "address": r.get("Address"), "price": r.get("Ask Price"), "dom": r.get("DOM"),
+            "lat": r["Latitude"],
+            "lon": r["Longitude"],
+            "type": "Active listing",
+            "address": r.get("Address"),
+            "zip": r.get("ZIP"),
+            "price": r.get("Ask Price"),
+            "price_label": "Asking price",
+            "rent": None,
+            "beds": r.get("Beds"),
+            "baths": r.get("Baths"),
+            "sqft": r.get("Sq Ft"),
+            "year_built": None,
+            "dom": r.get("DOM"),
+            "date": r.get("Listed"),
+            "distance": r.get("Distance (mi)"),
             "detail": f"Listed {r.get('Listed') or 'date unavailable'}",
         })
+
     for _, r in comps_df.dropna(subset=["Latitude","Longitude"]).iterrows() if not comps_df.empty else []:
         rows.append({
-            "lat": r["Latitude"], "lon": r["Longitude"], "type": "AVM comp",
-            "address": r.get("Address"), "price": r.get("Price"), "dom": r.get("DOM"),
+            "lat": r["Latitude"],
+            "lon": r["Longitude"],
+            "type": "AVM comp",
+            "address": r.get("Address"),
+            "zip": r.get("ZIP"),
+            "price": r.get("Price"),
+            "price_label": "Comp price",
+            "rent": None,
+            "beds": r.get("Beds"),
+            "baths": r.get("Baths"),
+            "sqft": r.get("Sq Ft"),
+            "year_built": None,
+            "dom": r.get("DOM"),
+            "date": r.get("Listed"),
+            "distance": r.get("Distance (mi)"),
             "detail": f"{r.get('Distance (mi)'):.2f} mi away" if pd.notna(r.get("Distance (mi)")) else "Comparable property",
         })
-    return pd.DataFrame(rows)
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out["price_text"] = out["price"].apply(lambda x: money(x) if pd.notna(x) and x not in (None, "") else "—")
+        out["rent_text"] = out["rent"].apply(lambda x: money(x) + "/mo" if pd.notna(x) and x not in (None, "") else "—")
+        out["dom_text"] = out["dom"].apply(lambda x: f"{int(x)} days" if pd.notna(x) else "—")
+        out["distance_text"] = out["distance"].apply(lambda x: f"{float(x):.2f} mi" if pd.notna(x) else "—")
+        out["beds_baths"] = out.apply(
+            lambda r: f'{r["beds"] if pd.notna(r["beds"]) else "—"} bd · {r["baths"] if pd.notna(r["baths"]) else "—"} ba',
+            axis=1,
+        )
+        out["sqft_text"] = out["sqft"].apply(lambda x: f"{int(x):,} sf" if pd.notna(x) else "—")
+    return out
 
 
 def render_neighborhood_map(map_df, subject_lat=None, subject_lon=None):
     if map_df.empty:
         st.info("No map coordinates were returned.")
-        return
+        return None
 
     color_map = {
         "Subject property": [89, 99, 79, 255],
@@ -382,24 +949,35 @@ def render_neighborhood_map(map_df, subject_lat=None, subject_lon=None):
         "Active listing": [214, 137, 63, 220],
         "AVM comp": [126, 92, 120, 190],
     }
+
+    layer_ids = {
+        "Subject property": "subject-property",
+        "Recent sale": "recent-sales",
+        "Active listing": "active-listings",
+        "AVM comp": "avm-comps",
+    }
+
     layers = []
     for category, rgba in color_map.items():
         layer_df = map_df[map_df["type"] == category]
         if layer_df.empty:
             continue
+
         radius = 105 if category == "Subject property" else 70
         layers.append(
             pdk.Layer(
                 "ScatterplotLayer",
+                id=layer_ids[category],
                 data=layer_df,
                 get_position="[lon, lat]",
                 get_fill_color=rgba,
-                get_line_color=[255,255,255,220],
+                get_line_color=[255,255,255,230],
                 line_width_min_pixels=1,
                 get_radius=radius,
-                radius_min_pixels=7 if category == "Subject property" else 5,
-                radius_max_pixels=16 if category == "Subject property" else 11,
+                radius_min_pixels=8 if category == "Subject property" else 6,
+                radius_max_pixels=18 if category == "Subject property" else 12,
                 pickable=True,
+                auto_highlight=True,
                 stroked=True,
             )
         )
@@ -413,34 +991,160 @@ def render_neighborhood_map(map_df, subject_lat=None, subject_lon=None):
         longitude=float(subject_lon),
         zoom=13.2,
         pitch=0,
+        controller=True,
     )
+
     tooltip = {
-        "html": "<b>{type}</b><br/>{address}<br/><b>Price:</b> {price}<br/><b>DOM:</b> {dom}<br/>{detail}",
+        "html": (
+            "<b>{type}</b><br/>"
+            "{address}<br/>"
+            "<b>{price_label}:</b> {price_text}<br/>"
+            "<b>ZIP:</b> {zip}<br/>"
+            "<b>Home:</b> {beds_baths} · {sqft_text}<br/>"
+            "<b>DOM:</b> {dom_text}<br/>"
+            "<b>Distance:</b> {distance_text}<br/>"
+            "{detail}<br/><br/>"
+            "<b>Click this dot for full details below.</b>"
+        ),
         "style": {"backgroundColor": "#252A24", "color": "white"},
     }
+
     deck = pdk.Deck(
         layers=layers,
         initial_view_state=view_state,
         map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
         tooltip=tooltip,
     )
-    st.pydeck_chart(deck, use_container_width=True)
-    st.caption("Map legend: subject property · recent recorded sales · active listings · AVM comparable properties.")
 
+    st.markdown(
+        """
+        <div class="map-legend">
+          <div class="map-legend-item"><span class="map-dot subject"></span><strong>Subject property</strong> — house being analyzed</div>
+          <div class="map-legend-item"><span class="map-dot sale"></span><strong>Recent sale</strong> — recorded sold property</div>
+          <div class="map-legend-item"><span class="map-dot active"></span><strong>Active listing</strong> — currently for sale</div>
+          <div class="map-legend-item"><span class="map-dot comp"></span><strong>AVM comp</strong> — comparable used in valuation</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.caption("Click any property dot. A full detail card will open directly below the map.")
+    event = st.pydeck_chart(
+        deck,
+        use_container_width=True,
+        height=520,
+        on_select="rerun",
+        selection_mode="single-object",
+        key="norvim_neighborhood_map",
+    )
+
+    selected = None
+    try:
+        objects = event.selection.get("objects", {})
+        for layer_id in layer_ids.values():
+            layer_objects = objects.get(layer_id, [])
+            if layer_objects:
+                selected = layer_objects[0]
+                break
+    except Exception:
+        selected = None
+
+    if selected:
+        st.markdown("##### Selected property")
+        st.markdown(
+            f"**{selected.get('address') or 'Property'}**  \n"
+            f"{selected.get('type') or 'Property'}"
+            + (f" · ZIP {selected.get('zip')}" if selected.get("zip") else "")
+        )
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            result_card(
+                selected.get("price_label") or "Price",
+                selected.get("price_text") or "—",
+                selected.get("date") or selected.get("detail"),
+            )
+        with c2:
+            result_card(
+                "Beds / baths",
+                selected.get("beds_baths") or "—",
+                selected.get("sqft_text") or "—",
+            )
+        with c3:
+            result_card(
+                "Days on market",
+                selected.get("dom_text") or "—",
+                f'Distance {selected.get("distance_text") or "—"}',
+            )
+        with c4:
+            if selected.get("type") == "Subject property":
+                result_card(
+                    "Estimated rent",
+                    selected.get("rent_text") or "—",
+                    f'Built {selected.get("year_built")}' if selected.get("year_built") else "Subject property",
+                )
+            else:
+                ppsf = None
+                try:
+                    if selected.get("price") and selected.get("sqft"):
+                        ppsf = float(selected["price"]) / float(selected["sqft"])
+                except Exception:
+                    pass
+                result_card(
+                    "$ / Sq Ft",
+                    f'${ppsf:,.0f}' if ppsf else "—",
+                    selected.get("detail"),
+                )
+
+        if selected.get("type") == "Subject property":
+            st.info(
+                "This is the house you are analyzing. Use the BRRRR Deal Coach, Property Record, "
+                "Listing, Sales Comps, and Area Market tabs for the full investment analysis."
+            )
+        elif selected.get("type") == "Recent sale":
+            st.success(
+                "This is a nearby recorded sale. Compare its size, condition, sale date, distance, "
+                "and ZIP with the subject before treating it as a strong comp."
+            )
+        elif selected.get("type") == "Active listing":
+            st.info(
+                "This is active competition, not a closed sale. It helps show current asking prices "
+                "and market time, but an asking price is not the same as a verified sold price."
+            )
+        elif selected.get("type") == "AVM comp":
+            st.info(
+                "This is one of the AVM comparable properties returned by RentCast. Review its ZIP, "
+                "distance, similarity, condition, and sale/listing status before relying on it."
+            )
+    else:
+        st.info("Select a dot on the map to see that property's details here.")
+
+    st.caption(
+        "Map legend: subject property · recent recorded sales · active listings · AVM comparable properties."
+    )
+    return selected
 
 
 def offer_math(strategy, arv, rent, rehab, closing, selling, holding, contingency, target_profit, assignment, refi_ltv, vacancy, opex, cap):
     arv, rent, rehab = max(float(arv or 0),0), max(float(rent or 0),0), max(float(rehab or 0),0)
-    close_d = arv*closing/100; sell_d = arv*selling/100; cont_d = rehab*contingency/100
-    flip = max(0, arv-rehab-close_d-sell_d-holding-cont_d-target_profit)
-    if strategy == "Flip": return flip, "Maximum purchase price", "ARV less rehab, costs, contingency and target profit."
-    if strategy == "Wholesale": return max(0, flip-assignment), "Maximum contract price", f"Leaves about {money(assignment)} for your assignment fee."
+    close_rate = max(float(closing or 0), 0) / 100
+    sell_d = arv * max(float(selling or 0), 0) / 100
+    cont_d = rehab * max(float(contingency or 0), 0) / 100
+
+    # Closing costs are modeled as a percentage of the purchase price, so solve for purchase.
+    flip_numerator = arv - rehab - sell_d - holding - cont_d - target_profit
+    flip = max(0, flip_numerator / (1 + close_rate))
+    if strategy == "Flip":
+        return flip, "Maximum purchase price", "Solves for purchase price after rehab, selling costs, holding, contingency, target profit and purchase-based closing costs."
+    if strategy == "Wholesale":
+        return max(0, flip-assignment), "Maximum contract price", f"Leaves about {money(assignment)} for your assignment fee before the end buyer reaches the modeled flip ceiling."
     if strategy == "BRRRR":
-        ceiling = max(0, arv*refi_ltv/100-rehab-close_d-holding-cont_d)
-        return ceiling, "Max purchase for modeled refinance", f"Uses a {refi_ltv:.0f}% ARV refinance assumption."
+        numerator = arv * refi_ltv / 100 - rehab - holding - cont_d
+        ceiling = max(0, numerator / (1 + close_rate))
+        return ceiling, "Max purchase for modeled refinance", f"Uses a {refi_ltv:.0f}% ARV refinance assumption and purchase-based acquisition closing costs."
     noi = rent*12*(1-vacancy/100)*(1-opex/100)
     value = noi/(cap/100) if cap else 0
-    return max(0, value-rehab-close_d-holding-cont_d), "Maximum purchase price", f"Uses a {cap:.1f}% target cap rate and modeled NOI of {money(noi)}."
+    numerator = value - rehab - holding - cont_d
+    return max(0, numerator / (1 + close_rate)), "Maximum purchase price", f"Uses a {cap:.1f}% target cap rate and modeled NOI of {money(noi)}."
 
 
 
@@ -880,6 +1584,237 @@ def render_action_card(title, copy):
         unsafe_allow_html=True,
     )
 
+
+def flip_scenario(purchase, arv, rehab, closing_pct, selling_pct, holding, contingency_pct):
+    purchase = max(float(purchase or 0), 0)
+    arv = max(float(arv or 0), 0)
+    rehab = max(float(rehab or 0), 0)
+    acquisition = purchase * float(closing_pct or 0) / 100
+    selling_cost = arv * float(selling_pct or 0) / 100
+    contingency = rehab * float(contingency_pct or 0) / 100
+    total_cost = purchase + acquisition + rehab + selling_cost + float(holding or 0) + contingency
+    profit = arv - total_cost
+    invested_basis = purchase + acquisition + rehab + float(holding or 0) + contingency
+    roi = profit / invested_basis if invested_basis else None
+    margin = profit / arv if arv else None
+    return {
+        "profit": profit,
+        "roi": roi,
+        "margin": margin,
+        "total_cost": total_cost,
+        "acquisition_closing": acquisition,
+        "selling_cost": selling_cost,
+        "contingency": contingency,
+    }
+
+
+def rental_buy_hold_model(
+    purchase, rent, rehab, closing_pct, down_payment_pct, rate_pct, term_years,
+    annual_taxes, annual_insurance, monthly_hoa,
+    vacancy_pct, management_pct, maintenance_pct, capex_pct, monthly_other=0
+):
+    purchase = max(float(purchase or 0), 0)
+    rent = max(float(rent or 0), 0)
+    rehab = max(float(rehab or 0), 0)
+    down = purchase * float(down_payment_pct or 0) / 100
+    loan = max(purchase - down, 0)
+    acquisition = purchase * float(closing_pct or 0) / 100
+    cash_in = down + acquisition + rehab
+    payment = monthly_pi_payment(loan, rate_pct, term_years)
+
+    vacancy = rent * float(vacancy_pct or 0) / 100
+    management = rent * float(management_pct or 0) / 100
+    maintenance = rent * float(maintenance_pct or 0) / 100
+    capex = rent * float(capex_pct or 0) / 100
+    taxes = float(annual_taxes or 0) / 12
+    insurance = float(annual_insurance or 0) / 12
+    hoa = float(monthly_hoa or 0)
+    other = float(monthly_other or 0)
+
+    noi_monthly = rent - vacancy - management - maintenance - capex - taxes - insurance - hoa - other
+    cash_flow = noi_monthly - payment
+    total_basis = purchase + acquisition + rehab
+    dscr = noi_monthly / payment if payment else None
+    cap_rate = (noi_monthly * 12 / total_basis) if total_basis else None
+    cash_on_cash = (cash_flow * 12 / cash_in) if cash_in else None
+    return {
+        "loan": loan,
+        "down_payment": down,
+        "cash_in": cash_in,
+        "payment": payment,
+        "noi_monthly": noi_monthly,
+        "cash_flow": cash_flow,
+        "annual_cash_flow": cash_flow * 12,
+        "dscr": dscr,
+        "cap_rate": cap_rate,
+        "cash_on_cash": cash_on_cash,
+        "total_basis": total_basis,
+    }
+
+
+def strategy_match(
+    purchase_price, arv, rent, rehab, closing, selling, holding, contingency,
+    flip_target_profit, flip_min_roi,
+    wholesale_fee_target,
+    refi_ltv, refi_rate, refi_term, refi_closing,
+    annual_taxes, annual_insurance, monthly_hoa,
+    vacancy, management, maintenance, capex_reserve,
+    brrrr_min_cf, brrrr_max_cash_left, min_dscr,
+    rental_down, rental_rate, rental_term, rental_min_cf, rental_target_cap,
+):
+    flip = flip_scenario(purchase_price, arv, rehab, closing, selling, holding, contingency)
+    flip_pass = flip["profit"] >= flip_target_profit and (flip["roi"] or -999) >= flip_min_roi / 100
+    flip_checks = [
+        flip["profit"] >= flip_target_profit,
+        (flip["roi"] or -999) >= flip_min_roi / 100,
+        flip["profit"] > 0,
+    ]
+
+    flip_ceiling, _, _ = offer_math(
+        "Flip", arv, rent, rehab, closing, selling, holding, contingency,
+        flip_target_profit, wholesale_fee_target, refi_ltv, vacancy, 35, rental_target_cap
+    )
+    wholesale_spread = max(flip_ceiling - float(purchase_price or 0), 0)
+    wholesale_pass = wholesale_spread >= wholesale_fee_target
+    wholesale_checks = [
+        wholesale_spread >= wholesale_fee_target,
+        purchase_price <= flip_ceiling,
+    ]
+
+    brrrr = brrrr_model(
+        purchase_price, arv, rent, rehab, closing, holding, contingency,
+        refi_ltv, refi_rate, refi_term, refi_closing,
+        annual_taxes, annual_insurance, monthly_hoa,
+        vacancy, management, maintenance, capex_reserve, 0
+    )
+    brrrr_checks = [
+        brrrr["monthly_cash_flow"] >= brrrr_min_cf,
+        brrrr["cash_left"] <= brrrr_max_cash_left,
+        brrrr.get("dscr") is not None and brrrr["dscr"] >= min_dscr,
+        brrrr["equity_created_vs_cost"] > 0,
+    ]
+    brrrr_pass = all(brrrr_checks)
+
+    rental = rental_buy_hold_model(
+        purchase_price, rent, rehab, closing, rental_down, rental_rate, rental_term,
+        annual_taxes, annual_insurance, monthly_hoa,
+        vacancy, management, maintenance, capex_reserve, 0
+    )
+    rental_checks = [
+        rental["cash_flow"] >= rental_min_cf,
+        rental.get("dscr") is not None and rental["dscr"] >= min_dscr,
+        rental.get("cap_rate") is not None and rental["cap_rate"] >= rental_target_cap / 100,
+    ]
+    rental_pass = all(rental_checks)
+
+    def status(checks, passed):
+        count = sum(bool(x) for x in checks)
+        if passed:
+            return "Meets targets", "good", count
+        if count >= max(1, len(checks) - 1):
+            return "Close / review", "warn", count
+        return "Doesn't meet targets", "bad", count
+
+    fs, fk, fscore = status(flip_checks, flip_pass)
+    ws, wk, wscore = status(wholesale_checks, wholesale_pass)
+    bs, bk, bscore = status(brrrr_checks, brrrr_pass)
+    rs, rk, rscore = status(rental_checks, rental_pass)
+
+    rows = [
+        {
+            "strategy": "Flip", "status": fs, "kind": fk, "score": fscore, "max_score": len(flip_checks),
+            "primary": flip["profit"], "primary_label": "Projected net profit",
+            "secondary": flip["roi"], "secondary_label": "ROI",
+            "max_purchase": flip_ceiling,
+            "details": flip,
+        },
+        {
+            "strategy": "Wholesale", "status": ws, "kind": wk, "score": wscore, "max_score": len(wholesale_checks),
+            "primary": wholesale_spread, "primary_label": "Available spread",
+            "secondary": None, "secondary_label": "",
+            "max_purchase": max(flip_ceiling - wholesale_fee_target, 0),
+            "details": {"spread": wholesale_spread, "end_buyer_max": flip_ceiling},
+        },
+        {
+            "strategy": "BRRRR", "status": bs, "kind": bk, "score": bscore, "max_score": len(brrrr_checks),
+            "primary": brrrr["monthly_cash_flow"], "primary_label": "Monthly cash flow",
+            "secondary": brrrr["equity_after_refi"], "secondary_label": "Equity after refi",
+            "max_purchase": offer_math("BRRRR", arv, rent, rehab, closing, selling, holding, contingency, flip_target_profit, wholesale_fee_target, refi_ltv, vacancy, 35, rental_target_cap)[0],
+            "details": brrrr,
+        },
+        {
+            "strategy": "Rental", "status": rs, "kind": rk, "score": rscore, "max_score": len(rental_checks),
+            "primary": rental["cash_flow"], "primary_label": "Monthly cash flow",
+            "secondary": rental["cap_rate"], "secondary_label": "Cap rate",
+            "max_purchase": offer_math("Rental", arv, rent, rehab, closing, selling, holding, contingency, flip_target_profit, wholesale_fee_target, refi_ltv, vacancy, 35, rental_target_cap)[0],
+            "details": rental,
+        },
+    ]
+    # Rank by comparable, strategy-specific threshold strength rather than raw dollars.
+    # This prevents a $40k flip profit from being mechanically compared with $400/mo BRRRR cash flow.
+    for row in rows:
+        row["fit_ratio"] = row["score"] / row["max_score"] if row["max_score"] else 0
+        row["passed"] = row["status"] == "Meets targets"
+        d = row["details"]
+        if row["strategy"] == "Flip":
+            profit_strength = max(d.get("profit", 0), 0) / max(float(flip_target_profit or 1), 1)
+            roi_strength = max(d.get("roi") or 0, 0) / max(float(flip_min_roi or 1) / 100, 0.0001)
+            row["strength"] = (min(profit_strength, 2.0) + min(roi_strength, 2.0)) / 2
+        elif row["strategy"] == "Wholesale":
+            row["strength"] = min(max(d.get("spread", 0), 0) / max(float(wholesale_fee_target or 1), 1), 2.0)
+        elif row["strategy"] == "BRRRR":
+            cf_strength = max(d.get("monthly_cash_flow", 0), 0) / max(float(brrrr_min_cf or 1), 1)
+            dscr_strength = max(d.get("dscr") or 0, 0) / max(float(min_dscr or 1), 0.01)
+            cash_left_strength = 2.0 if d.get("cash_left", 0) <= 0 else min(float(brrrr_max_cash_left or 1) / max(d.get("cash_left", 1), 1), 2.0)
+            equity_strength = 1.5 if d.get("equity_created_vs_cost", 0) > 0 else 0
+            row["strength"] = (min(cf_strength, 2.0) + min(dscr_strength, 2.0) + cash_left_strength + equity_strength) / 4
+        else:
+            cf_strength = max(d.get("cash_flow", 0), 0) / max(float(rental_min_cf or 1), 1)
+            dscr_strength = max(d.get("dscr") or 0, 0) / max(float(min_dscr or 1), 0.01)
+            cap_strength = max(d.get("cap_rate") or 0, 0) / max(float(rental_target_cap or 1) / 100, 0.0001)
+            row["strength"] = (min(cf_strength, 2.0) + min(dscr_strength, 2.0) + min(cap_strength, 2.0)) / 3
+    rows = sorted(rows, key=lambda r: (r["passed"], r["fit_ratio"], r.get("strength", 0)), reverse=True)
+    return rows
+
+
+def strategy_row_by_name(results, name):
+    for r in results or []:
+        if r.get("strategy") == name:
+            return r
+    return None
+
+
+def strategy_explanation(row):
+    if not row:
+        return ""
+    s = row["strategy"]
+    d = row["details"]
+    if s == "Flip":
+        return f"{money(d.get('profit'))} projected net profit · {d.get('roi')*100:.1f}% ROI" if d.get("roi") is not None else f"{money(d.get('profit'))} projected net profit"
+    if s == "Wholesale":
+        return f"{money(d.get('spread'))} modeled spread before your assignment fee target."
+    if s == "BRRRR":
+        dscr = d.get("dscr")
+        return f"{money(d.get('monthly_cash_flow'))}/mo cash flow · {money(d.get('cash_left'))} cash left · {money(d.get('equity_after_refi'))} equity" + (f" · {dscr:.2f}x rent cushion" if dscr is not None else "")
+    if s == "Rental":
+        dscr = d.get("dscr")
+        return f"{money(d.get('cash_flow'))}/mo cash flow" + (f" · {d.get('cap_rate')*100:.2f}% cap rate" if d.get("cap_rate") is not None else "") + (f" · {dscr:.2f}x rent cushion" if dscr is not None else "")
+    return ""
+
+
+def render_strategy_card(row):
+    if not row:
+        return
+    st.markdown(
+        f'<div class="strategy-card {row["kind"]}">'
+        f'<div class="strategy-name">{row["strategy"]}</div>'
+        f'<div class="strategy-status">{row["status"]}</div>'
+        f'<div class="strategy-copy">{strategy_explanation(row)}<br><br>'
+        f'<strong>Modeled max purchase:</strong> {money(row.get("max_purchase"))}</div>'
+        f'</div>',
+        unsafe_allow_html=True
+    )
+
 def comp_df(comps):
     rows=[]
     for c in comps or []:
@@ -976,7 +1911,21 @@ def history_df(data):
                 })
     return pd.DataFrame(rows).sort_values("Period") if rows else pd.DataFrame()
 
-st.markdown('<div class="k">NORVIM 13 LLC</div><div class="t">Deal Analyzer</div><div class="s">Address → ARV → comps → market speed → rent → maximum offer.</div>', unsafe_allow_html=True)
+st.markdown('<div class="k">NORVIM 13 LLC</div><div class="t">DealFinder 2.0</div><div class="s">Property intelligence → strategy match → offer scenarios → pipeline.</div>', unsafe_allow_html=True)
+
+
+app_access_code = str(get_setting("APP_ACCESS_CODE", "") or "").strip()
+if app_access_code:
+    if st.session_state.get("norvim_access_ok") is not True:
+        st.subheader("NORVIM DealFinder")
+        access_try = st.text_input("Access code", type="password")
+        if st.button("Enter", type="primary"):
+            if access_try == app_access_code:
+                st.session_state["norvim_access_ok"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect access code.")
+        st.stop()
 
 with st.sidebar:
     st.subheader("Property data")
@@ -984,25 +1933,69 @@ with st.sidebar:
     if not key:
         entered = st.text_input("RentCast API key", type="password", help="For testing. Use Streamlit Secrets on the live site.")
         if entered:
-            st.session_state["rentcast_api_key"] = entered; key = entered
-    else: st.success("Property-data API connected")
-    st.caption("Core analysis: about 5 API requests the first time. The optional neighborhood map uses 2 more requests once, then stays cached for 30 days.")
-    st.divider(); st.subheader("Deal assumptions")
-    strategy = st.selectbox("Strategy", ["Flip","Wholesale","BRRRR","Rental"])
+            st.session_state["rentcast_api_key"] = entered
+            key = entered
+    else:
+        st.success("Property-data API connected")
+
+    monthly_limit = int(float(get_setting("RENTCAST_MONTHLY_LIMIT", 50) or 50))
+    tracked_usage = db_monthly_api_usage()
+    remaining = max(monthly_limit - tracked_usage, 0)
+    st.markdown(f"**Estimated RentCast remaining:** {remaining} / {monthly_limit}")
+    st.progress(min(max(tracked_usage / monthly_limit if monthly_limit else 0, 0), 1))
+    if db_enabled():
+        st.caption("Usage counter is stored in the NORVIM database. It tracks successful requests made by this app plus any configured starting offset.")
+    else:
+        st.caption("Usage counter is session-only until Supabase is connected. Set RENTCAST_USAGE_OFFSET if you already used requests this month.")
+    st.link_button("Open RentCast dashboard", "https://app.rentcast.io/app/api", use_container_width=True)
+    st.caption("Core analysis uses up to ~5 successful requests on a fresh property. Cached properties use 0. Neighborhood RentCast data is optional and uses up to 2 more.")
+
+    st.divider()
+    st.subheader("Deal assumptions")
+    strategy = st.selectbox("Your preferred strategy", ["Flip","Wholesale","BRRRR","Rental"])
+    purchase_override = st.number_input(
+        "Seller ask / target purchase price",
+        min_value=0.0, value=0.0, step=5000.0,
+        help="Enter the price you are evaluating. Leave 0 to use the active listing price when available, otherwise the modeled ceiling."
+    )
     rehab = st.number_input("Rehab budget", 0.0, value=40000.0, step=5000.0)
-    closing = st.number_input("Purchase/closing costs (% of ARV)", 0.0, 20.0, 2.0, .5)
+    closing = st.number_input("Acquisition closing costs (% of purchase)", 0.0, 20.0, 2.0, .5)
     selling = st.number_input("Selling costs (% of ARV)", 0.0, 20.0, 8.0, .5)
-    holding = st.number_input("Holding + financing", 0.0, value=12000.0, step=1000.0)
+    holding = st.number_input("Holding + pre-exit financing", 0.0, value=12000.0, step=1000.0)
     contingency = st.number_input("Rehab contingency (%)", 0.0, 50.0, 10.0, 1.0)
-    target_profit, assignment, refi_ltv, vacancy, opex, cap = 35000.0,10000.0,75.0,5.0,35.0,8.0
-    if strategy in ("Flip","Wholesale"):
-        target_profit = st.number_input("End-buyer target profit", 0.0, value=35000.0, step=5000.0)
-    if strategy == "Wholesale": assignment = st.number_input("Your assignment fee", 0.0, value=10000.0, step=1000.0)
-    if strategy == "BRRRR": refi_ltv = st.number_input("Refinance LTV (% of ARV)", 1.0, 100.0, 75.0, 1.0)
-    if strategy == "Rental":
+
+    with st.expander("Strategy Match targets", expanded=False):
+        target_profit = st.number_input("Flip target net profit", 0.0, value=35000.0, step=5000.0)
+        flip_min_roi = st.number_input("Minimum flip ROI (%)", 0.0, 100.0, 15.0, 1.0)
+        assignment = st.number_input("Wholesale assignment target", 0.0, value=10000.0, step=1000.0)
+        refi_ltv = st.number_input("BRRRR refinance LTV (% of ARV)", 1.0, 100.0, 75.0, 1.0)
+        refi_rate_match = st.number_input("BRRRR refinance rate (%)", 0.0, 25.0, 7.5, .25)
+        refi_term_match = st.number_input("BRRRR refinance term (years)", 1, 40, 30, 1)
+        refi_closing_match = st.number_input("BRRRR refinance closing costs (%)", 0.0, 10.0, 2.0, .25)
+        brrrr_min_cf = st.number_input("Minimum BRRRR monthly cash flow", 0.0, value=250.0, step=50.0)
+        brrrr_max_cash_left = st.number_input("Maximum cash left after refi", 0.0, value=25000.0, step=5000.0)
+        min_dscr_global = st.number_input("Minimum rent cushion / DSCR", 0.0, 5.0, 1.20, .05)
+
+        rental_down = st.number_input("Rental down payment (%)", 0.0, 100.0, 20.0, 1.0)
+        rental_rate = st.number_input("Rental loan rate (%)", 0.0, 25.0, 7.5, .25)
+        rental_term = st.number_input("Rental loan term (years)", 1, 40, 30, 1)
+        rental_min_cf = st.number_input("Minimum rental monthly cash flow", 0.0, value=250.0, step=50.0)
+        cap = st.number_input("Target rental cap rate (%)", .1, 30.0, 6.0, .25)
+
         vacancy = st.number_input("Vacancy allowance (%)", 0.0, 50.0, 5.0, 1.0)
-        opex = st.number_input("Operating expenses (% of effective rent)", 0.0, 90.0, 35.0, 1.0)
-        cap = st.number_input("Target cap rate (%)", .1, 30.0, 8.0, .25)
+        management_match = st.number_input("Property management reserve (%)", 0.0, 30.0, 8.0, 1.0)
+        maintenance_match = st.number_input("Maintenance reserve (%)", 0.0, 30.0, 5.0, 1.0)
+        capex_match = st.number_input("CapEx reserve (%)", 0.0, 30.0, 5.0, 1.0)
+        insurance_match = st.number_input("Annual insurance estimate", 0.0, value=3000.0, step=250.0)
+        opex = st.number_input("Legacy rental operating expense (%)", 0.0, 90.0, 35.0, 1.0)
+
+    st.divider()
+    if db_enabled():
+        st.success("NORVIM database connected")
+        st.caption("Permanent property snapshots, API usage and CRM pipeline are enabled.")
+    else:
+        st.info("Database not connected")
+        st.caption("The app still works. Add Supabase later for permanent caching, CRM history and scaling.")
 
 with st.form("address_form"):
     address = st.text_input("Property address", placeholder="1234 Example St, Houston, TX 77021")
@@ -1012,22 +2005,51 @@ if submitted:
     if not address.strip(): st.error("Enter a property address first.")
     elif not key: st.error("Add a RentCast API key in the sidebar or Streamlit Secrets.")
     else:
-        with st.spinner("Pulling valuation, comps, rent and market data..."):
+        with st.spinner("Checking NORVIM cache, then pulling property data if needed..."):
             try:
                 address_clean = address.strip()
                 address_key = normalize_address(address_clean)
-                val, rent_data, market, property_record, listing_record, fetched_at = analyze_cached(address_key, key, address_clean)
-                st.session_state["analysis"] = {
-                    "input": address_clean,
-                    "address_key": address_key,
-                    "valuation": val,
-                    "rent": rent_data,
-                    "market": market,
-                    "property_record": property_record,
-                    "listing_record": listing_record,
-                    "time": fetched_at,
-                }
-            except Exception as e: st.error(str(e))
+                db_snapshot = db_get_cached_snapshot(address_key, max_age_days=30)
+                if db_snapshot:
+                    st.session_state["analysis"] = {
+                        "input": address_clean,
+                        "address_key": address_key,
+                        "valuation": db_snapshot.get("valuation") or {},
+                        "rent": db_snapshot.get("rent") or {},
+                        "market": db_snapshot.get("market") or {},
+                        "property_record": db_snapshot.get("property_record") or {},
+                        "listing_record": db_snapshot.get("listing_record") or {},
+                        "time": db_snapshot.get("time") or utc_now_iso(),
+                        "cache_source": "NORVIM database",
+                    }
+                else:
+                    val, rent_data, market, property_record, listing_record, fetched_at = analyze_cached(address_key, key, address_clean)
+                    fresh = {
+                        "input": address_clean,
+                        "address_key": address_key,
+                        "valuation": val,
+                        "rent": rent_data,
+                        "market": market,
+                        "property_record": property_record,
+                        "listing_record": listing_record,
+                        "time": fetched_at,
+                        "cache_source": "fresh RentCast / Streamlit cache",
+                    }
+                    st.session_state["analysis"] = fresh
+                    db_save_snapshot(
+                        address_key,
+                        address_clean,
+                        {
+                            "valuation": val,
+                            "rent": rent_data,
+                            "market": market,
+                            "property_record": property_record,
+                            "listing_record": listing_record,
+                            "time": fetched_at,
+                        },
+                    )
+            except Exception as e:
+                st.error(str(e))
 
 A = st.session_state.get("analysis")
 if not A:
@@ -1058,10 +2080,10 @@ with m2: result_card("ARV range", f'{money(val.get("priceRangeLow"))} – {money
 with m3: result_card("Estimated rent", f'{money(rent_m)}/mo')
 with m4: result_card(label, money(ceiling))
 st.caption(note)
-st.info(f'Data snapshot saved: {A["time"]}. The same normalized address will reuse this snapshot for up to 30 days, avoiding another RentCast charge/request.')
+st.info(f'Data snapshot: {A["time"]} · source: {A.get("cache_source","Streamlit cache")}. When the NORVIM database is connected, the same address can survive app redeploys and reuse a snapshot for up to 30 days.')
 st.warning("Underwriting estimate only. Verify title, condition, flood risk, taxes, liens, repair scope and local comps before contracting.")
 
-tabs=st.tabs(["Overview","Property record","Listing","Deal","BRRRR","Sales comps","Neighborhood map","Area market","Rental","Export"])
+tabs=st.tabs(["DealFinder","Property record","Listing","Deal","BRRRR","Sales comps","Neighborhood map","Area market","Rental","Export","Strategy Match","Offer Lab","Neighborhood Intel","CRM"])
 
 # Precompute reusable tables and summary statistics from the three API responses.
 cdf_all=comp_df(val.get("comparables") or [])
@@ -1094,9 +2116,69 @@ same_zip_indicated_arv = (
     else None
 )
 
+latest_tax_match, latest_tax_year_match = latest_property_tax(property_record)
+hoa_match = float(((property_record.get("hoa") or {}).get("fee")) or 0)
+listing_price_match = listing_record.get("price")
+if purchase_override and purchase_override > 0:
+    purchase_scenario = float(purchase_override)
+elif listing_price_match not in (None, 0):
+    purchase_scenario = float(listing_price_match)
+else:
+    purchase_scenario = float(ceiling or 0)
+
+strategy_results = strategy_match(
+    purchase_scenario, arv, rent_m, rehab, closing, selling, holding, contingency,
+    target_profit, flip_min_roi,
+    assignment,
+    refi_ltv, refi_rate_match, refi_term_match, refi_closing_match,
+    latest_tax_match, insurance_match, hoa_match,
+    vacancy, management_match, maintenance_match, capex_match,
+    brrrr_min_cf, brrrr_max_cash_left, min_dscr_global,
+    rental_down, rental_rate, rental_term, rental_min_cf, cap,
+)
+preferred_result = strategy_row_by_name(strategy_results, strategy)
+best_result = strategy_results[0] if strategy_results else None
+
+strategy_results_json = []
+for item in strategy_results:
+    clean = {k:v for k,v in item.items() if k != "details"}
+    clean["details"] = item.get("details") or {}
+    strategy_results_json.append(clean)
+
 with tabs[0]:
-    if strategy == "BRRRR":
-        st.info("Want the simple answer? Open **BRRRR Deal Coach** for profitability, monthly profit, equity, cash left in the deal, rent cushion, and suggested next moves.")
+    st.markdown("#### DealFinder decision support")
+    if preferred_result and preferred_result.get("status") == "Meets targets":
+        decision_title = f"Your {strategy} plan meets the targets you entered"
+        decision_copy = strategy_explanation(preferred_result)
+    elif best_result and best_result.get("status") == "Meets targets":
+        decision_title = f"{strategy} does not meet all targets at {money(purchase_scenario)}"
+        decision_copy = (
+            f"The strongest modeled alternative is {best_result['strategy']}, which currently meets your configured thresholds. "
+            f"{strategy_explanation(best_result)}"
+        )
+    elif best_result:
+        decision_title = f"No strategy fully meets your targets at {money(purchase_scenario)}"
+        decision_copy = (
+            f"{best_result['strategy']} is currently the closest modeled fit, but it still needs review. "
+            f"{strategy_explanation(best_result)}"
+        )
+    else:
+        decision_title = "Strategy analysis unavailable"
+        decision_copy = "Review the assumptions and property data."
+
+    st.markdown(
+        f'<div class="big-decision"><div class="title">{decision_title}</div>'
+        f'<div class="copy">{decision_copy}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    d1,d2,d3,d4=st.columns(4)
+    with d1: result_card("Purchase scenario", money(purchase_scenario), "Seller ask / target price being tested")
+    with d2: result_card("Preferred strategy", strategy, preferred_result.get("status") if preferred_result else "—")
+    with d3: result_card("Strongest modeled fit", best_result.get("strategy") if best_result else "—", best_result.get("status") if best_result else "—")
+    with d4: result_card("Same-ZIP comps", len(cdf_same_zip), f"ZIP {zip_code}")
+
+    st.caption("DealFinder compares Flip, Wholesale, BRRRR and Rental every time. A result means the strategy meets or misses your configured thresholds; it is not a guarantee to buy or avoid the property.")
     st.markdown("#### Property & neighborhood snapshot")
     p1,p2,p3,p4=st.columns(4)
     with p1: result_card("ZIP code", zip_code)
@@ -1712,7 +2794,15 @@ with tabs[6]:
             zip_dom = sd.get("medianDaysOnMarket") if sd else None
             result_card("ZIP median DOM", f'{zip_dom} days' if zip_dom is not None else "—", speed_label(zip_dom))
 
-        map_df = neighborhood_map_rows(subj, rsdf, aldf, cdf)
+        map_df = neighborhood_map_rows(
+            subj,
+            rsdf,
+            aldf,
+            cdf,
+            valuation=val,
+            rent_data=rent_data,
+            property_record=property_record,
+        )
         st.markdown("##### Interactive property map")
         render_neighborhood_map(map_df, subj.get("latitude"), subj.get("longitude"))
 
@@ -1854,6 +2944,10 @@ with tabs[9]:
         "listing_date":listing_record.get("listedDate"),
         "mls_name":listing_record.get("mlsName"),
         "mls_number":listing_record.get("mlsNumber"),
+        "purchase_scenario":purchase_scenario,
+        "preferred_strategy_result":preferred_result.get("status") if preferred_result else None,
+        "strongest_modeled_strategy":best_result.get("strategy") if best_result else None,
+        "strongest_modeled_status":best_result.get("status") if best_result else None,
     }
     csv=pd.DataFrame([row]).to_csv(index=False).encode("utf-8")
     st.download_button("Download deal summary CSV",csv,"norvim_deal_analysis.csv","text/csv",use_container_width=True)
@@ -1869,4 +2963,288 @@ with tabs[9]:
             st.download_button("Download neighborhood recent sales CSV",rs_export.to_csv(index=False).encode("utf-8"),"norvim_neighborhood_recent_sales.csv","text/csv",use_container_width=True)
         if not al_export.empty:
             st.download_button("Download neighborhood active listings CSV",al_export.to_csv(index=False).encode("utf-8"),"norvim_neighborhood_active_listings.csv","text/csv",use_container_width=True)
-    st.caption("v1.8 makes BRRRR analysis easier to read: a friendly profitability snapshot, plain-English cash flow and equity cards, simple checks, and suggested next moves.")
+    st.caption("Deal summary export. Strategy Match, CRM and public-data intelligence are available in their dedicated tabs.")
+
+
+with tabs[10]:
+    st.markdown("#### Strategy Match")
+    st.caption("All four strategies are evaluated at the same purchase price. Change the price in the sidebar or use Offer Lab to test negotiations.")
+
+    st.markdown(f"**Purchase scenario:** {money(purchase_scenario)}")
+    cols = st.columns(4)
+    for col, row in zip(cols, [strategy_row_by_name(strategy_results, n) for n in ["Flip","Wholesale","BRRRR","Rental"]]):
+        with col:
+            render_strategy_card(row)
+
+    preferred = strategy_row_by_name(strategy_results, strategy)
+    if preferred and preferred["status"] != "Meets targets" and best_result and best_result["strategy"] != strategy:
+        st.warning(
+            f"You selected **{strategy}**, but it does not currently meet all of your targets. "
+            f"**{best_result['strategy']}** has the strongest modeled fit at this price. "
+            "Review the underlying assumptions before changing your plan."
+        )
+    elif preferred and preferred["status"] == "Meets targets":
+        st.success(f"Your selected **{strategy}** strategy meets the thresholds you entered at this purchase scenario.")
+    else:
+        st.info("No strategy fully meets the current thresholds. Use Offer Lab to see whether a lower purchase price changes the result.")
+
+    rows = []
+    for r in strategy_results:
+        secondary = r.get("secondary")
+        if r["strategy"] in ("BRRRR","Rental"):
+            secondary_text = strategy_explanation(r)
+        elif r["strategy"] == "Flip":
+            secondary_text = f'{r["details"].get("roi")*100:.1f}% ROI' if r["details"].get("roi") is not None else "—"
+        else:
+            secondary_text = "End-buyer spread model"
+        rows.append({
+            "Strategy": r["strategy"],
+            "Result": r["status"],
+            "Modeled max purchase": r["max_purchase"],
+            r["primary_label"]: r["primary"],
+            "Summary": secondary_text,
+        })
+    smdf = pd.DataFrame(rows)
+    money_cols = [c for c in smdf.columns if c in ["Modeled max purchase","Projected net profit","Available spread","Monthly cash flow"]]
+    fmt = {c:"${:,.0f}" for c in money_cols}
+    st.dataframe(smdf.style.format(fmt, na_rep="—"), use_container_width=True, hide_index=True)
+
+    st.markdown("##### How the match is decided")
+    st.write(
+        "Flip checks target net profit and ROI. Wholesale checks whether there is enough room below the modeled end-buyer flip ceiling. "
+        "BRRRR checks monthly cash flow, cash left after refinance, rent cushion (DSCR), and equity creation. "
+        "Rental checks monthly cash flow, rent cushion, and cap rate."
+    )
+
+
+with tabs[11]:
+    st.markdown("#### Offer Lab")
+    st.caption("This section recalculates locally. Moving the slider does **not** make another RentCast request.")
+
+    base_price = max(float(purchase_scenario or 0), 50000)
+    low_price = max(10000, int((base_price - 100000) // 5000 * 5000))
+    high_price = max(low_price + 10000, int((base_price + 50000) // 5000 * 5000))
+    test_price = st.slider(
+        "Test purchase price",
+        min_value=int(low_price),
+        max_value=int(high_price),
+        value=int(min(max(base_price, low_price), high_price)),
+        step=5000,
+        format="$%d",
+    )
+    lab = strategy_match(
+        test_price, arv, rent_m, rehab, closing, selling, holding, contingency,
+        target_profit, flip_min_roi, assignment,
+        refi_ltv, refi_rate_match, refi_term_match, refi_closing_match,
+        latest_tax_match, insurance_match, hoa_match,
+        vacancy, management_match, maintenance_match, capex_match,
+        brrrr_min_cf, brrrr_max_cash_left, min_dscr_global,
+        rental_down, rental_rate, rental_term, rental_min_cf, cap,
+    )
+    lab_best = lab[0] if lab else None
+    o1,o2,o3,o4=st.columns(4)
+    flip_lab = strategy_row_by_name(lab,"Flip")
+    brrrr_lab = strategy_row_by_name(lab,"BRRRR")
+    rental_lab = strategy_row_by_name(lab,"Rental")
+    wholesale_lab = strategy_row_by_name(lab,"Wholesale")
+    with o1: result_card("Flip profit", money((flip_lab or {}).get("details",{}).get("profit")), (flip_lab or {}).get("status"))
+    with o2: result_card("Wholesale spread", money((wholesale_lab or {}).get("details",{}).get("spread")), (wholesale_lab or {}).get("status"))
+    with o3: result_card("BRRRR cash flow", money((brrrr_lab or {}).get("details",{}).get("monthly_cash_flow")) + "/mo", (brrrr_lab or {}).get("status"))
+    with o4: result_card("Rental cash flow", money((rental_lab or {}).get("details",{}).get("cash_flow")) + "/mo", (rental_lab or {}).get("status"))
+
+    if lab_best:
+        st.info(f"At **{money(test_price)}**, the strongest modeled fit is **{lab_best['strategy']}** ({lab_best['status']}).")
+
+    st.markdown("##### Price sensitivity")
+    ladder = []
+    step = 10000
+    start_p = max(10000, int(base_price - 80000))
+    end_p = int(base_price + 30000)
+    for p in range(start_p, end_p + 1, step):
+        rr = strategy_match(
+            p, arv, rent_m, rehab, closing, selling, holding, contingency,
+            target_profit, flip_min_roi, assignment,
+            refi_ltv, refi_rate_match, refi_term_match, refi_closing_match,
+            latest_tax_match, insurance_match, hoa_match,
+            vacancy, management_match, maintenance_match, capex_match,
+            brrrr_min_cf, brrrr_max_cash_left, min_dscr_global,
+            rental_down, rental_rate, rental_term, rental_min_cf, cap,
+        )
+        f = strategy_row_by_name(rr,"Flip")
+        w = strategy_row_by_name(rr,"Wholesale")
+        b = strategy_row_by_name(rr,"BRRRR")
+        r = strategy_row_by_name(rr,"Rental")
+        ladder.append({
+            "Purchase": p,
+            "Flip Profit": (f or {}).get("details",{}).get("profit"),
+            "Flip Result": (f or {}).get("status"),
+            "Wholesale Spread": (w or {}).get("details",{}).get("spread"),
+            "BRRRR Cash Flow": (b or {}).get("details",{}).get("monthly_cash_flow"),
+            "BRRRR Cash Left": (b or {}).get("details",{}).get("cash_left"),
+            "Rental Cash Flow": (r or {}).get("details",{}).get("cash_flow"),
+            "Best Fit": rr[0]["strategy"] if rr else None,
+        })
+    ldf = pd.DataFrame(ladder)
+    st.dataframe(
+        ldf.style.format({
+            "Purchase":"${:,.0f}",
+            "Flip Profit":"${:,.0f}",
+            "Wholesale Spread":"${:,.0f}",
+            "BRRRR Cash Flow":"${:,.0f}",
+            "BRRRR Cash Left":"${:,.0f}",
+            "Rental Cash Flow":"${:,.0f}",
+        }, na_rep="—"),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+with tabs[12]:
+    st.markdown("#### Neighborhood Intelligence")
+    st.caption("These sources are separate from RentCast. Loading them does not consume RentCast requests.")
+
+    census_key = str(get_setting("CENSUS_API_KEY", "") or "").strip()
+    subject_lat = subj.get("latitude") or property_record.get("latitude")
+    subject_lon = subj.get("longitude") or property_record.get("longitude")
+
+    if st.button("Load free/public neighborhood data", type="primary", use_container_width=True, key="public_intel_load"):
+        with st.spinner("Checking FEMA, City of Houston public GIS and Census data..."):
+            st.session_state["public_intel"] = public_intelligence_cached(
+                A["address_key"], subject_lat, subject_lon, zip_code, census_key
+            )
+
+    pintel = st.session_state.get("public_intel")
+    if pintel:
+        st.markdown('<span class="source-pill">FEMA NFHL</span><span class="source-pill">Houston 311 GIS</span><span class="source-pill">Houston PlatTracker</span><span class="source-pill">U.S. Census ACS (optional key)</span>', unsafe_allow_html=True)
+
+        flood = pintel.get("flood") or {}
+        st.markdown("##### Flood screening")
+        f1,f2,f3,f4=st.columns(4)
+        with f1: result_card("FEMA flood zone", flood.get("FLD_ZONE") or "No intersecting record")
+        with f2: result_card("Special Flood Hazard Area", "Yes" if str(flood.get("SFHA_TF")).upper() in ("T","Y","TRUE") else ("No" if flood else "—"))
+        with f3: result_card("Zone subtype", flood.get("ZONE_SUBTY") or "—")
+        with f4: result_card("Static BFE", flood.get("STATIC_BFE") if flood.get("STATIC_BFE") not in (None,"") else "—")
+        st.caption("Screening only. Flood maps and insurance requirements should be verified with FEMA, the lender and an insurance professional.")
+
+        cases = pintel.get("311") or []
+        top311, df311 = summarize_311(cases)
+        st.markdown("##### Houston 311 activity — within 0.5 mile")
+        st.write(f"Recent 311 cases returned: **{len(cases)}**")
+        if top311:
+            top_df = pd.DataFrame(top311[:10], columns=["Service request category","Count"])
+            st.dataframe(top_df, use_container_width=True, hide_index=True)
+        else:
+            st.caption("No recent 311 records were returned, or the City service was temporarily unavailable.")
+        st.caption("The City's recent 311 layer contains open cases and recently closed cases, so this is a current-activity signal rather than a full 12-month history.")
+
+        plat_apps = summarize_plats(pintel.get("plat_apps") or [])
+        final_plats = summarize_plats(pintel.get("final_plats") or [])
+        st.markdown("##### Development / plat activity — within 1 mile")
+        p1,p2=st.columns(2)
+        with p1: result_card("Plat applications", len(plat_apps), "Potential/current subdivision activity")
+        with p2: result_card("Final plats", len(final_plats), "Approved plat records returned")
+        if not plat_apps.empty:
+            st.dataframe(plat_apps.head(30), use_container_width=True, hide_index=True)
+
+        census = pintel.get("census") or {}
+        st.markdown(f"##### ZIP {zip_code} housing & economic context")
+        if census:
+            c1,c2,c3,c4=st.columns(4)
+            with c1: result_card("Population", f'{census.get("population"):,.0f}' if census.get("population") is not None else "—")
+            with c2: result_card("Median household income", money(census.get("median_household_income")))
+            with c3: result_card("Vacancy rate", f'{census.get("vacancy_rate")*100:.1f}%' if census.get("vacancy_rate") is not None else "—")
+            with c4: result_card("Owner occupied", f'{census.get("owner_rate")*100:.1f}%' if census.get("owner_rate") is not None else "—")
+            c5,c6,c7,c8=st.columns(4)
+            with c5: result_card("Renter occupied", f'{census.get("renter_rate")*100:.1f}%' if census.get("renter_rate") is not None else "—")
+            with c6: result_card("ACS median gross rent", money(census.get("median_gross_rent")))
+            with c7: result_card("ACS median home value", money(census.get("median_home_value")))
+            with c8: result_card("Median year built", f'{census.get("median_year_built"):.0f}' if census.get("median_year_built") is not None else "—")
+        else:
+            st.info("Census profile is optional. Add a free CENSUS_API_KEY in Streamlit Secrets to load ACS ZIP-level housing/economic data.")
+
+    st.markdown("##### Research shortcuts — no paid property API")
+    encoded_address = quote_plus(subj.get("formattedAddress") or A["input"])
+    encoded_area = quote_plus(" ".join([str(x) for x in [property_record.get("subdivision"), zip_code, "Houston development"] if x]))
+    r1,r2,r3,r4,r5=st.columns(5)
+    with r1: st.link_button("Search exact address", f"https://www.google.com/search?q=%22{encoded_address}%22", use_container_width=True)
+    with r2: st.link_button("Neighborhood development", f"https://www.google.com/search?q={encoded_area}", use_container_width=True)
+    with r3: st.link_button("HCAD property search", "https://hcad.org/quicksearch/", use_container_width=True)
+    with r4: st.link_button("Houston permits", "https://permits.houstontx.gov/", use_container_width=True)
+    with r5: st.link_button("FEMA flood maps", "https://msc.fema.gov/portal/home", use_container_width=True)
+
+
+with tabs[13]:
+    st.markdown("#### NORVIM CRM / acquisition pipeline")
+    if not db_enabled():
+        st.warning("Connect Supabase to make the CRM permanent. Until then, analyses can still be exported but CRM changes will not survive redeploys.")
+        st.code(
+            'SUPABASE_URL = "https://YOUR_PROJECT.supabase.co"\\n'
+            'SUPABASE_SERVICE_ROLE_KEY = "YOUR_SERVER_SIDE_KEY"\\n'
+            'NORVIM_ORG_ID = "norvim"'
+        )
+        st.caption("Run the included supabase_schema.sql in Supabase first. Keep the service-role key only in Streamlit Secrets; never put it in GitHub.")
+    else:
+        prop_row = db_upsert_property(subj, property_record, A["address_key"], A["input"])
+        property_id = (prop_row or {}).get("id")
+        st.success("Permanent CRM storage is connected.")
+
+        with st.form("crm_form"):
+            c1,c2,c3=st.columns(3)
+            with c1:
+                lead_status = st.selectbox("Pipeline status", ["New Lead","Researching","Contacted","Follow Up","Offer Sent","Negotiating","Under Contract","Rehab","Listed / Renting","Closed","Dead Lead"])
+                lead_source = st.text_input("Lead source", placeholder="Driving for dollars, wholesaler, referral...")
+                preferred_crm_strategy = st.selectbox("Preferred strategy", ["Flip","Wholesale","BRRRR","Rental"], index=["Flip","Wholesale","BRRRR","Rental"].index(strategy))
+            with c2:
+                seller_name = st.text_input("Seller / contact name")
+                seller_phone = st.text_input("Phone")
+                seller_email = st.text_input("Email")
+            with c3:
+                seller_ask = st.number_input("Seller ask", 0.0, value=float(listing_price_match or purchase_scenario or 0), step=5000.0)
+                offer_amount = st.number_input("Your offer", 0.0, value=float(ceiling or 0), step=5000.0)
+                follow_up = st.date_input("Follow-up date", value=None)
+            partner = st.text_input("Partner / JV / buyer")
+            notes = st.text_area("Notes", height=140)
+            save_crm = st.form_submit_button("Save property + analysis + CRM", type="primary", use_container_width=True)
+
+        if save_crm:
+            if not property_id:
+                st.error("Could not create the permanent property record.")
+            else:
+                lead_ok = db_save_lead(property_id, {
+                    "status": lead_status,
+                    "lead_source": lead_source,
+                    "seller_name": seller_name,
+                    "seller_phone": seller_phone,
+                    "seller_email": seller_email,
+                    "partner": partner,
+                    "preferred_strategy": preferred_crm_strategy,
+                    "seller_ask": seller_ask,
+                    "offer_amount": offer_amount,
+                    "follow_up_date": follow_up.isoformat() if follow_up else None,
+                    "notes": notes,
+                })
+                assumptions = {
+                    "rehab": rehab, "closing_pct": closing, "selling_pct": selling, "holding": holding,
+                    "contingency_pct": contingency, "flip_target_profit": target_profit, "flip_min_roi": flip_min_roi,
+                    "assignment_target": assignment, "refi_ltv": refi_ltv, "refi_rate": refi_rate_match,
+                    "insurance": insurance_match, "vacancy_pct": vacancy, "management_pct": management_match,
+                }
+                run_ok = db_save_underwriting(
+                    property_id, A["address_key"], strategy, purchase_scenario, strategy_results_json, assumptions
+                )
+                if lead_ok and run_ok:
+                    st.success("Saved to the NORVIM pipeline.")
+                else:
+                    st.warning("Some CRM data did not save. Check the database configuration.")
+
+        pipeline = db_get_pipeline()
+        if pipeline:
+            st.markdown("##### Pipeline")
+            pdf = pd.DataFrame(pipeline)
+            show_cols = [c for c in ["address","status","preferred_strategy","seller_ask","offer_amount","follow_up_date","partner","updated_at"] if c in pdf.columns]
+            st.dataframe(pdf[show_cols] if show_cols else pdf, use_container_width=True, hide_index=True)
+        else:
+            st.caption("No saved pipeline records yet.")
+
+
+st.caption("NORVIM DealFinder 2.0 · strategy matching, offer sensitivity, public-data intelligence, permanent-cache/CRM hooks and API usage tracking.")
