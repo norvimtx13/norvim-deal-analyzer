@@ -11,7 +11,7 @@ import pydeck as pdk
 API_BASE = "https://api.rentcast.io/v1"
 CACHE_TTL_SECONDS = 30 * 24 * 60 * 60  # 30 days
 
-st.set_page_config(page_title="NORVIM DealFinder 2.0", page_icon="🏠", layout="wide")
+st.set_page_config(page_title="NORVIM DealFinder 2.2", page_icon="🏠", layout="wide")
 st.markdown("""
 <style>
 :root { color-scheme: light !important; }
@@ -180,6 +180,50 @@ def money(v):
     except: return "—"
 
 
+def parse_money_input(value, default=0.0):
+    """Parse user-entered dollar text such as 320,000 or $320,000."""
+    try:
+        cleaned = re.sub(r"[^0-9.\-]", "", str(value or ""))
+        return float(cleaned) if cleaned not in ("", "-", ".") else float(default)
+    except Exception:
+        return float(default)
+
+
+def _format_money_state(key):
+    value = parse_money_input(st.session_state.get(key, "0"), 0)
+    st.session_state[key] = f"{value:,.0f}"
+
+
+def money_input(label, default=0.0, key=None, help=None):
+    """Dollar input that keeps thousands separators visible for easier underwriting."""
+    if not key:
+        key = "money_" + re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
+    if key not in st.session_state:
+        st.session_state[key] = f"{float(default):,.0f}"
+    raw = st.text_input(
+        label,
+        key=key,
+        help=help,
+        on_change=_format_money_state,
+        args=(key,),
+    )
+    return parse_money_input(raw, default)
+
+
+def state_number(key, default):
+    try:
+        return float(st.session_state.get(key, default))
+    except Exception:
+        return float(default)
+
+
+def state_int(key, default):
+    try:
+        return int(st.session_state.get(key, default))
+    except Exception:
+        return int(default)
+
+
 def result_card(label, value, sub=None):
     safe_label = str(label or "")
     safe_value = str(value or "—")
@@ -247,7 +291,8 @@ def db_request(method, table, params=None, payload=None, prefer=None, timeout=20
         return []
 
 
-def db_get_cached_snapshot(address_key, max_age_days=30):
+def db_get_cached_snapshot(address_key, max_age_days=None):
+    """Return the latest saved snapshot. If max_age_days is None, return it regardless of age."""
     if not db_enabled():
         return None
     _, _, org_id = supabase_config()
@@ -271,16 +316,40 @@ def db_get_cached_snapshot(address_key, max_age_days=30):
             return None
         dt = datetime.fromisoformat(str(fetched_at).replace("Z", "+00:00"))
         age_days = (datetime.now(timezone.utc) - dt).total_seconds() / 86400
-        if age_days > max_age_days:
+        if max_age_days is not None and age_days > float(max_age_days):
             return None
         snap = row.get("snapshot") or {}
         if not isinstance(snap, dict):
             return None
+        snap = dict(snap)
         snap["_db_cache_age_days"] = age_days
         return snap
     except Exception as e:
         st.session_state["db_last_error"] = str(e)
         return None
+
+
+def iso_age_days(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - dt).total_seconds() / 86400
+    except Exception:
+        return None
+
+
+def snapshot_field_fresh(snapshot, timestamp_key, max_age_days, value_key=None, fallback_to_time=True):
+    """Check freshness for one section inside a property snapshot."""
+    if not isinstance(snapshot, dict):
+        return False
+    if value_key is not None and value_key not in snapshot:
+        return False
+    stamp = snapshot.get(timestamp_key)
+    if not stamp and fallback_to_time:
+        stamp = snapshot.get("time")
+    age = iso_age_days(stamp)
+    return age is not None and age <= float(max_age_days)
 
 
 def db_save_snapshot(address_key, address, snapshot):
@@ -304,6 +373,17 @@ def db_save_snapshot(address_key, address, snapshot):
     except Exception as e:
         st.session_state["db_last_error"] = str(e)
         return False
+
+
+def db_merge_save_snapshot(address_key, address, updates):
+    """Merge one optional/deep data section into the latest permanent snapshot."""
+    if not db_enabled():
+        return False
+    current = db_get_cached_snapshot(address_key, max_age_days=None) or {}
+    current.pop("_db_cache_age_days", None)
+    current.update(updates or {})
+    current["time"] = utc_now_iso()
+    return db_save_snapshot(address_key, address, current)
 
 
 def db_upsert_property(subject, property_record, address_key, fallback_address):
@@ -469,7 +549,7 @@ def db_monthly_api_usage():
 
 def safe_public_get(url, params=None, timeout=18):
     try:
-        r = requests.get(url, params=params or {}, timeout=timeout, headers={"User-Agent": "NORVIM-DealFinder/2.0"})
+        r = requests.get(url, params=params or {}, timeout=timeout, headers={"User-Agent": "NORVIM-DealFinder/2.2"})
         if not r.ok:
             return {"_error": f"HTTP {r.status_code}"}
         data = r.json()
@@ -703,35 +783,51 @@ def normalize_address(address):
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def analyze_cached(address_key, key, _address_for_api):
-    """
-    Fetch one property snapshot and cache it for 30 days.
-    _address_for_api starts with an underscore so Streamlit does not hash formatting differences;
-    address_key is the normalized identity used for the cache key.
-    """
-    val = api_get("/avm/value", {"address":_address_for_api,"lookupSubjectAttributes":"true","maxRadius":2,"daysOld":365,"compCount":15}, key, address_key)
-    rent = api_get("/avm/rent/long-term", {"address":_address_for_api,"lookupSubjectAttributes":"true","maxRadius":3,"daysOld":365,"compCount":15}, key, address_key)
-    subj = val.get("subjectProperty") or {}
-    market = api_get("/markets", {"zipCode":subj.get("zipCode"), "dataType":"All", "historyRange":12}, key, address_key) if subj.get("zipCode") else {}
+def quick_scan_cached(address_key, key, _address_for_api):
+    """Default scan: exactly two RentCast endpoints — value AVM and long-term rent AVM."""
+    val = api_get(
+        "/avm/value",
+        {"address": _address_for_api, "lookupSubjectAttributes": "true", "maxRadius": 2, "daysOld": 365, "compCount": 15},
+        key,
+        address_key,
+    )
+    rent = api_get(
+        "/avm/rent/long-term",
+        {"address": _address_for_api, "lookupSubjectAttributes": "true", "maxRadius": 3, "daysOld": 365, "compCount": 15},
+        key,
+        address_key,
+    )
+    return val, rent, utc_now_iso()
 
-    # Public-record profile: owner, tax history, sale history, HOA, subdivision, features, etc.
-    property_payload = api_get_optional("/properties", {"address":_address_for_api}, key, address_key)
-    property_record = first_record(property_payload)
 
-    # Exact sale-listing record (if one exists). The listing record contains current status,
-    # asking price, DOM, MLS/agent/office data, and listing history.
-    listing_record = {}
-    property_id = property_record.get("id") or subj.get("id")
-    if property_id:
-        listing_record = api_get_optional(
-            f"/listings/sale/{quote(str(property_id), safe='')}",
-            {},
-            key,
-            address_key,
-        )
+@st.cache_data(ttl=180 * 24 * 60 * 60, show_spinner=False)
+def property_record_cached(address_key, key, _address_for_api):
+    """Optional public-record profile. Loaded only when the user asks for it."""
+    payload = api_get_optional("/properties", {"address": _address_for_api}, key, address_key)
+    return first_record(payload), utc_now_iso()
 
-    fetched_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-    return val, rent, market, property_record, listing_record, fetched_at
+
+@st.cache_data(ttl=7 * 24 * 60 * 60, show_spinner=False)
+def listing_record_cached(address_key, key, property_id):
+    """Optional exact sale-listing record. Loaded only when requested."""
+    if not property_id:
+        return {}, utc_now_iso()
+    record = api_get_optional(
+        f"/listings/sale/{quote(str(property_id), safe='')}",
+        {},
+        key,
+        address_key,
+    )
+    return record or {}, utc_now_iso()
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def market_zip_cached(zip_code, key):
+    """Optional ZIP market data. One ZIP snapshot can be reused across many properties."""
+    if not zip_code:
+        return {}, utc_now_iso()
+    market = api_get("/markets", {"zipCode": str(zip_code), "dataType": "All", "historyRange": 12}, key, f"zip::{zip_code}")
+    return market or {}, utc_now_iso()
 
 
 
@@ -1911,7 +2007,7 @@ def history_df(data):
                 })
     return pd.DataFrame(rows).sort_values("Period") if rows else pd.DataFrame()
 
-st.markdown('<div class="k">NORVIM 13 LLC</div><div class="t">DealFinder 2.0</div><div class="s">Property intelligence → strategy match → offer scenarios → pipeline.</div>', unsafe_allow_html=True)
+st.markdown('<div class="k">NORVIM 13 LLC</div><div class="t">DealFinder 2.2</div><div class="s">2-call Quick Scan → strategy match → optional deep research → pipeline.</div>', unsafe_allow_html=True)
 
 
 app_access_code = str(get_setting("APP_ACCESS_CODE", "") or "").strip()
@@ -1943,51 +2039,14 @@ with st.sidebar:
     remaining = max(monthly_limit - tracked_usage, 0)
     st.markdown(f"**Estimated RentCast remaining:** {remaining} / {monthly_limit}")
     st.progress(min(max(tracked_usage / monthly_limit if monthly_limit else 0, 0), 1))
+    if remaining >= 2:
+        st.caption(f"At 2 calls per uncached Quick Scan, that is roughly {remaining // 2} new-property scans before optional deep research.")
     if db_enabled():
         st.caption("Usage counter is stored in the NORVIM database. It tracks successful requests made by this app plus any configured starting offset.")
     else:
         st.caption("Usage counter is session-only until Supabase is connected. Set RENTCAST_USAGE_OFFSET if you already used requests this month.")
     st.link_button("Open RentCast dashboard", "https://app.rentcast.io/app/api", use_container_width=True)
-    st.caption("Core analysis uses up to ~5 successful requests on a fresh property. Cached properties use 0. Neighborhood RentCast data is optional and uses up to 2 more.")
-
-    st.divider()
-    st.subheader("Deal assumptions")
-    strategy = st.selectbox("Your preferred strategy", ["Flip","Wholesale","BRRRR","Rental"])
-    purchase_override = st.number_input(
-        "Seller ask / target purchase price",
-        min_value=0.0, value=0.0, step=5000.0,
-        help="Enter the price you are evaluating. Leave 0 to use the active listing price when available, otherwise the modeled ceiling."
-    )
-    rehab = st.number_input("Rehab budget", 0.0, value=40000.0, step=5000.0)
-    closing = st.number_input("Acquisition closing costs (% of purchase)", 0.0, 20.0, 2.0, .5)
-    selling = st.number_input("Selling costs (% of ARV)", 0.0, 20.0, 8.0, .5)
-    holding = st.number_input("Holding + pre-exit financing", 0.0, value=12000.0, step=1000.0)
-    contingency = st.number_input("Rehab contingency (%)", 0.0, 50.0, 10.0, 1.0)
-
-    with st.expander("Strategy Match targets", expanded=False):
-        target_profit = st.number_input("Flip target net profit", 0.0, value=35000.0, step=5000.0)
-        flip_min_roi = st.number_input("Minimum flip ROI (%)", 0.0, 100.0, 15.0, 1.0)
-        assignment = st.number_input("Wholesale assignment target", 0.0, value=10000.0, step=1000.0)
-        refi_ltv = st.number_input("BRRRR refinance LTV (% of ARV)", 1.0, 100.0, 75.0, 1.0)
-        refi_rate_match = st.number_input("BRRRR refinance rate (%)", 0.0, 25.0, 7.5, .25)
-        refi_term_match = st.number_input("BRRRR refinance term (years)", 1, 40, 30, 1)
-        refi_closing_match = st.number_input("BRRRR refinance closing costs (%)", 0.0, 10.0, 2.0, .25)
-        brrrr_min_cf = st.number_input("Minimum BRRRR monthly cash flow", 0.0, value=250.0, step=50.0)
-        brrrr_max_cash_left = st.number_input("Maximum cash left after refi", 0.0, value=25000.0, step=5000.0)
-        min_dscr_global = st.number_input("Minimum rent cushion / DSCR", 0.0, 5.0, 1.20, .05)
-
-        rental_down = st.number_input("Rental down payment (%)", 0.0, 100.0, 20.0, 1.0)
-        rental_rate = st.number_input("Rental loan rate (%)", 0.0, 25.0, 7.5, .25)
-        rental_term = st.number_input("Rental loan term (years)", 1, 40, 30, 1)
-        rental_min_cf = st.number_input("Minimum rental monthly cash flow", 0.0, value=250.0, step=50.0)
-        cap = st.number_input("Target rental cap rate (%)", .1, 30.0, 6.0, .25)
-
-        vacancy = st.number_input("Vacancy allowance (%)", 0.0, 50.0, 5.0, 1.0)
-        management_match = st.number_input("Property management reserve (%)", 0.0, 30.0, 8.0, 1.0)
-        maintenance_match = st.number_input("Maintenance reserve (%)", 0.0, 30.0, 5.0, 1.0)
-        capex_match = st.number_input("CapEx reserve (%)", 0.0, 30.0, 5.0, 1.0)
-        insurance_match = st.number_input("Annual insurance estimate", 0.0, value=3000.0, step=250.0)
-        opex = st.number_input("Legacy rental operating expense (%)", 0.0, 90.0, 35.0, 1.0)
+    st.caption("Quick Scan uses 2 successful RentCast requests on a new property and 0 when the NORVIM cache is fresh. Property record, listing, ZIP market and neighborhood data load only when you request them.")
 
     st.divider()
     if db_enabled():
@@ -1997,6 +2056,173 @@ with st.sidebar:
         st.info("Database not connected")
         st.caption("The app still works. Add Supabase later for permanent caching, CRM history and scaling.")
 
+# Strategy-specific widgets use stable keys, so Streamlit preserves values when you switch strategies.
+# Hidden strategies fall back to conservative defaults until you select and edit them.
+st.markdown("### Deal setup")
+st.caption("Choose the strategy you are evaluating. DealFinder keeps the setup at the top and only shows the assumptions that matter most for that strategy. Dollar inputs use thousands separators.")
+with st.container(border=True):
+    top1, top2, top3 = st.columns([1.0, 1.25, 1.25])
+    with top1:
+        strategy = st.selectbox(
+            "Strategy",
+            ["Flip", "Wholesale", "BRRRR", "Rental"],
+            key="setup_strategy",
+        )
+    with top2:
+        purchase_override = money_input(
+            "Seller ask / purchase price ($)",
+            0,
+            key="setup_purchase",
+            help="Enter the price you are evaluating. Leave 0 to use the active listing price when available; otherwise DealFinder uses the modeled ceiling.",
+        )
+    with top3:
+        rehab = money_input("Rehab budget ($)", 40000, key="setup_rehab")
+
+    core1, core2, core3 = st.columns(3)
+    with core1:
+        closing = st.number_input(
+            "Acquisition closing costs (% of purchase)",
+            0.0, 20.0, 2.0, 0.5,
+            key="setup_closing",
+        )
+    with core2:
+        holding = money_input("Holding + pre-exit financing ($)", 12000, key="setup_holding")
+    with core3:
+        contingency = st.number_input(
+            "Rehab contingency (%)",
+            0.0, 50.0, 10.0, 1.0,
+            key="setup_contingency",
+        )
+
+    st.markdown(f"##### {strategy} assumptions")
+
+    if strategy == "Flip":
+        s1, s2, s3 = st.columns(3)
+        with s1:
+            selling = st.number_input("Selling costs (% of ARV)", 0.0, 20.0, state_number("setup_selling", 8.0), 0.5, key="setup_selling")
+        with s2:
+            target_profit = money_input("Target net profit ($)", 35000, key="setup_target_profit_money")
+            st.session_state["setup_target_profit"] = target_profit
+        with s3:
+            flip_min_roi = st.number_input("Minimum flip ROI (%)", 0.0, 100.0, state_number("setup_flip_min_roi", 15.0), 1.0, key="setup_flip_min_roi")
+
+    elif strategy == "Wholesale":
+        s1, s2, s3, s4 = st.columns(4)
+        with s1:
+            selling = st.number_input("End-buyer selling costs (% ARV)", 0.0, 20.0, state_number("setup_selling", 8.0), 0.5, key="setup_selling")
+        with s2:
+            target_profit = money_input("End-buyer target profit ($)", 35000, key="setup_target_profit_money")
+            st.session_state["setup_target_profit"] = target_profit
+        with s3:
+            assignment = money_input("Your assignment target ($)", 10000, key="setup_assignment_money")
+            st.session_state["setup_assignment"] = assignment
+        with s4:
+            flip_min_roi = st.number_input("End-buyer minimum ROI (%)", 0.0, 100.0, state_number("setup_flip_min_roi", 15.0), 1.0, key="setup_flip_min_roi")
+
+    elif strategy == "BRRRR":
+        s1, s2, s3, s4 = st.columns(4)
+        with s1:
+            refi_ltv = st.number_input("Refi LTV (% of ARV)", 1.0, 100.0, state_number("setup_refi_ltv", 75.0), 1.0, key="setup_refi_ltv")
+        with s2:
+            refi_rate_match = st.number_input("Refi rate (%)", 0.0, 25.0, state_number("setup_refi_rate", 7.5), 0.25, key="setup_refi_rate")
+        with s3:
+            refi_term_match = st.number_input("Refi term (years)", 1, 40, state_int("setup_refi_term", 30), 1, key="setup_refi_term")
+        with s4:
+            refi_closing_match = st.number_input("Refi closing costs (%)", 0.0, 10.0, state_number("setup_refi_closing", 2.0), 0.25, key="setup_refi_closing")
+
+        s5, s6, s7 = st.columns(3)
+        with s5:
+            brrrr_min_cf = money_input("Minimum monthly cash flow ($)", 250, key="setup_brrrr_min_cf_money")
+            st.session_state["setup_brrrr_min_cf"] = brrrr_min_cf
+        with s6:
+            brrrr_max_cash_left = money_input("Maximum cash left after refi ($)", 25000, key="setup_brrrr_max_cash_left_money")
+            st.session_state["setup_brrrr_max_cash_left"] = brrrr_max_cash_left
+        with s7:
+            min_dscr_global = st.number_input("Minimum DSCR", 0.0, 5.0, state_number("setup_min_dscr", 1.20), 0.05, key="setup_min_dscr")
+
+        with st.expander("BRRRR operating assumptions", expanded=False):
+            o1, o2, o3 = st.columns(3)
+            with o1:
+                taxes_override_match = money_input("Annual property taxes override ($)", 0, key="setup_taxes_money", help="Leave 0 to use loaded property-tax data when available.")
+                st.session_state["setup_taxes_override"] = taxes_override_match
+            with o2:
+                insurance_match = money_input("Annual insurance estimate ($)", 3000, key="setup_insurance_money")
+                st.session_state["setup_insurance"] = insurance_match
+            with o3:
+                vacancy = st.number_input("Vacancy allowance (%)", 0.0, 50.0, state_number("setup_vacancy", 5.0), 1.0, key="setup_vacancy")
+            o4, o5, o6 = st.columns(3)
+            with o4:
+                management_match = st.number_input("Property management reserve (%)", 0.0, 30.0, state_number("setup_management", 8.0), 1.0, key="setup_management")
+            with o5:
+                maintenance_match = st.number_input("Maintenance reserve (%)", 0.0, 30.0, state_number("setup_maintenance", 5.0), 1.0, key="setup_maintenance")
+            with o6:
+                capex_match = st.number_input("CapEx reserve (%)", 0.0, 30.0, state_number("setup_capex", 5.0), 1.0, key="setup_capex")
+
+    else:  # Rental
+        s1, s2, s3, s4 = st.columns(4)
+        with s1:
+            rental_down = st.number_input("Down payment (%)", 0.0, 100.0, state_number("setup_rental_down", 20.0), 1.0, key="setup_rental_down")
+        with s2:
+            rental_rate = st.number_input("Loan rate (%)", 0.0, 25.0, state_number("setup_rental_rate", 7.5), 0.25, key="setup_rental_rate")
+        with s3:
+            rental_term = st.number_input("Loan term (years)", 1, 40, state_int("setup_rental_term", 30), 1, key="setup_rental_term")
+        with s4:
+            cap = st.number_input("Target cap rate (%)", 0.1, 30.0, state_number("setup_cap", 6.0), 0.25, key="setup_cap")
+
+        s5, s6 = st.columns(2)
+        with s5:
+            rental_min_cf = money_input("Minimum monthly cash flow ($)", 250, key="setup_rental_min_cf_money")
+            st.session_state["setup_rental_min_cf"] = rental_min_cf
+        with s6:
+            min_dscr_global = st.number_input("Minimum DSCR", 0.0, 5.0, state_number("setup_min_dscr", 1.20), 0.05, key="setup_min_dscr")
+
+        with st.expander("Rental operating assumptions", expanded=False):
+            o1, o2, o3 = st.columns(3)
+            with o1:
+                taxes_override_match = money_input("Annual property taxes override ($)", 0, key="setup_taxes_money", help="Leave 0 to use loaded property-tax data when available.")
+                st.session_state["setup_taxes_override"] = taxes_override_match
+            with o2:
+                insurance_match = money_input("Annual insurance estimate ($)", 3000, key="setup_insurance_money")
+                st.session_state["setup_insurance"] = insurance_match
+            with o3:
+                vacancy = st.number_input("Vacancy allowance (%)", 0.0, 50.0, state_number("setup_vacancy", 5.0), 1.0, key="setup_vacancy")
+            o4, o5, o6 = st.columns(3)
+            with o4:
+                management_match = st.number_input("Property management reserve (%)", 0.0, 30.0, state_number("setup_management", 8.0), 1.0, key="setup_management")
+            with o5:
+                maintenance_match = st.number_input("Maintenance reserve (%)", 0.0, 30.0, state_number("setup_maintenance", 5.0), 1.0, key="setup_maintenance")
+            with o6:
+                capex_match = st.number_input("CapEx reserve (%)", 0.0, 30.0, state_number("setup_capex", 5.0), 1.0, key="setup_capex")
+            o7, _ = st.columns([1, 2])
+            with o7:
+                opex = st.number_input("Legacy operating expense (%)", 0.0, 90.0, state_number("setup_opex", 35.0), 1.0, key="setup_opex")
+
+# Pull assumptions for strategies that are currently hidden. This lets Strategy Match
+# continue comparing all four strategies while keeping the screen uncluttered.
+selling = state_number("setup_selling", 8.0)
+target_profit = parse_money_input(st.session_state.get("setup_target_profit_money", st.session_state.get("setup_target_profit", 35000)), 35000)
+flip_min_roi = state_number("setup_flip_min_roi", 15.0)
+assignment = parse_money_input(st.session_state.get("setup_assignment_money", st.session_state.get("setup_assignment", 10000)), 10000)
+refi_ltv = state_number("setup_refi_ltv", 75.0)
+refi_rate_match = state_number("setup_refi_rate", 7.5)
+refi_term_match = state_int("setup_refi_term", 30)
+refi_closing_match = state_number("setup_refi_closing", 2.0)
+brrrr_min_cf = parse_money_input(st.session_state.get("setup_brrrr_min_cf_money", st.session_state.get("setup_brrrr_min_cf", 250)), 250)
+brrrr_max_cash_left = parse_money_input(st.session_state.get("setup_brrrr_max_cash_left_money", st.session_state.get("setup_brrrr_max_cash_left", 25000)), 25000)
+min_dscr_global = state_number("setup_min_dscr", 1.20)
+rental_down = state_number("setup_rental_down", 20.0)
+rental_rate = state_number("setup_rental_rate", 7.5)
+rental_term = state_int("setup_rental_term", 30)
+rental_min_cf = parse_money_input(st.session_state.get("setup_rental_min_cf_money", st.session_state.get("setup_rental_min_cf", 250)), 250)
+cap = state_number("setup_cap", 6.0)
+vacancy = state_number("setup_vacancy", 5.0)
+management_match = state_number("setup_management", 8.0)
+maintenance_match = state_number("setup_maintenance", 5.0)
+capex_match = state_number("setup_capex", 5.0)
+insurance_match = parse_money_input(st.session_state.get("setup_insurance_money", st.session_state.get("setup_insurance", 3000)), 3000)
+taxes_override_match = parse_money_input(st.session_state.get("setup_taxes_money", st.session_state.get("setup_taxes_override", 0)), 0)
+opex = state_number("setup_opex", 35.0)
+
 with st.form("address_form"):
     address = st.text_input("Property address", placeholder="1234 Example St, Houston, TX 77021")
     submitted = st.form_submit_button("Run deal analysis", type="primary", use_container_width=True)
@@ -2005,12 +2231,18 @@ if submitted:
     if not address.strip(): st.error("Enter a property address first.")
     elif not key: st.error("Add a RentCast API key in the sidebar or Streamlit Secrets.")
     else:
-        with st.spinner("Checking NORVIM cache, then pulling property data if needed..."):
+        with st.spinner("Quick Scan: checking NORVIM cache first, then ARV + rent only if needed..."):
             try:
                 address_clean = address.strip()
                 address_key = normalize_address(address_clean)
-                db_snapshot = db_get_cached_snapshot(address_key, max_age_days=30)
-                if db_snapshot:
+                db_snapshot = db_get_cached_snapshot(address_key, max_age_days=None) or {}
+                quick_fresh = (
+                    bool(db_snapshot.get("valuation"))
+                    and bool(db_snapshot.get("rent"))
+                    and snapshot_field_fresh(db_snapshot, "quick_fetched_at", 30, fallback_to_time=True)
+                )
+
+                if quick_fresh:
                     st.session_state["analysis"] = {
                         "input": address_clean,
                         "address_key": address_key,
@@ -2019,35 +2251,39 @@ if submitted:
                         "market": db_snapshot.get("market") or {},
                         "property_record": db_snapshot.get("property_record") or {},
                         "listing_record": db_snapshot.get("listing_record") or {},
+                        "quick_fetched_at": db_snapshot.get("quick_fetched_at") or db_snapshot.get("time"),
+                        "market_fetched_at": db_snapshot.get("market_fetched_at"),
+                        "property_record_fetched_at": db_snapshot.get("property_record_fetched_at"),
+                        "listing_record_fetched_at": db_snapshot.get("listing_record_fetched_at"),
                         "time": db_snapshot.get("time") or utc_now_iso(),
-                        "cache_source": "NORVIM database",
+                        "cache_source": "NORVIM database · 0 RentCast calls",
                     }
                 else:
-                    val, rent_data, market, property_record, listing_record, fetched_at = analyze_cached(address_key, key, address_clean)
-                    fresh = {
+                    val, rent_data, fetched_at = quick_scan_cached(address_key, key, address_clean)
+                    fresh_snapshot = dict(db_snapshot)
+                    fresh_snapshot.pop("_db_cache_age_days", None)
+                    fresh_snapshot.update({
+                        "valuation": val,
+                        "rent": rent_data,
+                        "quick_fetched_at": fetched_at,
+                        "time": fetched_at,
+                    })
+                    st.session_state["analysis"] = {
                         "input": address_clean,
                         "address_key": address_key,
                         "valuation": val,
                         "rent": rent_data,
-                        "market": market,
-                        "property_record": property_record,
-                        "listing_record": listing_record,
+                        "market": fresh_snapshot.get("market") or {},
+                        "property_record": fresh_snapshot.get("property_record") or {},
+                        "listing_record": fresh_snapshot.get("listing_record") or {},
+                        "quick_fetched_at": fetched_at,
+                        "market_fetched_at": fresh_snapshot.get("market_fetched_at"),
+                        "property_record_fetched_at": fresh_snapshot.get("property_record_fetched_at"),
+                        "listing_record_fetched_at": fresh_snapshot.get("listing_record_fetched_at"),
                         "time": fetched_at,
-                        "cache_source": "fresh RentCast / Streamlit cache",
+                        "cache_source": "Quick Scan · ARV + rent only",
                     }
-                    st.session_state["analysis"] = fresh
-                    db_save_snapshot(
-                        address_key,
-                        address_clean,
-                        {
-                            "valuation": val,
-                            "rent": rent_data,
-                            "market": market,
-                            "property_record": property_record,
-                            "listing_record": listing_record,
-                            "time": fetched_at,
-                        },
-                    )
+                    db_save_snapshot(address_key, address_clean, fresh_snapshot)
             except Exception as e:
                 st.error(str(e))
 
@@ -2080,17 +2316,29 @@ with m2: result_card("ARV range", f'{money(val.get("priceRangeLow"))} – {money
 with m3: result_card("Estimated rent", f'{money(rent_m)}/mo')
 with m4: result_card(label, money(ceiling))
 st.caption(note)
-st.info(f'Data snapshot: {A["time"]} · source: {A.get("cache_source","Streamlit cache")}. When the NORVIM database is connected, the same address can survive app redeploys and reuse a snapshot for up to 30 days.')
+st.info(f'Quick Scan snapshot: {A.get("quick_fetched_at") or A["time"]} · source: {A.get("cache_source","cache")}. New addresses use ARV + rent only (2 RentCast endpoints); fresh NORVIM-cached addresses use 0.')
 st.warning("Underwriting estimate only. Verify title, condition, flood risk, taxes, liens, repair scope and local comps before contracting.")
 
 tabs=st.tabs(["DealFinder","Property record","Listing","Deal","BRRRR","Sales comps","Neighborhood map","Area market","Rental","Export","Strategy Match","Offer Lab","Neighborhood Intel","CRM"])
 
-# Precompute reusable tables and summary statistics from the three API responses.
+# Precompute reusable tables from Quick Scan. ZIP market data is optional and loaded separately.
 cdf_all=comp_df(val.get("comparables") or [])
 rdf=rental_comp_df(rent_data.get("comparables") or [])
+zip_code=str(subj.get("zipCode") or market.get("zipCode") or "—")
+
+# Reuse one permanent ZIP-market snapshot across every property in that ZIP.
+market_fresh = bool(market) and snapshot_field_fresh(A, "market_fetched_at", 30, value_key="market", fallback_to_time=True)
+if not market_fresh:
+    market = {}
+    if db_enabled() and zip_code != "—":
+        zip_snapshot = db_get_cached_snapshot(f"zip::{zip_code}", max_age_days=30) or {}
+        if zip_snapshot.get("market"):
+            market = zip_snapshot.get("market") or {}
+            A["market"] = market
+            A["market_fetched_at"] = zip_snapshot.get("market_fetched_at") or zip_snapshot.get("time")
+            st.session_state["analysis"] = A
 sd=market.get("saleData") or {}
 rd=market.get("rentalData") or {}
-zip_code=str(subj.get("zipCode") or market.get("zipCode") or "—")
 
 # Houston-area ZIPs can change materially within a short distance.
 # Default investor comp set is therefore restricted to the subject ZIP.
@@ -2117,6 +2365,7 @@ same_zip_indicated_arv = (
 )
 
 latest_tax_match, latest_tax_year_match = latest_property_tax(property_record)
+effective_tax_match = float(taxes_override_match or latest_tax_match or 0)
 hoa_match = float(((property_record.get("hoa") or {}).get("fee")) or 0)
 listing_price_match = listing_record.get("price")
 if purchase_override and purchase_override > 0:
@@ -2131,7 +2380,7 @@ strategy_results = strategy_match(
     target_profit, flip_min_roi,
     assignment,
     refi_ltv, refi_rate_match, refi_term_match, refi_closing_match,
-    latest_tax_match, insurance_match, hoa_match,
+    effective_tax_match, insurance_match, hoa_match,
     vacancy, management_match, maintenance_match, capex_match,
     brrrr_min_cf, brrrr_max_cash_left, min_dscr_global,
     rental_down, rental_rate, rental_term, rental_min_cf, cap,
@@ -2178,7 +2427,9 @@ with tabs[0]:
     with d3: result_card("Strongest modeled fit", best_result.get("strategy") if best_result else "—", best_result.get("status") if best_result else "—")
     with d4: result_card("Same-ZIP comps", len(cdf_same_zip), f"ZIP {zip_code}")
 
-    st.caption("DealFinder compares Flip, Wholesale, BRRRR and Rental every time. A result means the strategy meets or misses your configured thresholds; it is not a guarantee to buy or avoid the property.")
+    st.caption("DealFinder compares Flip, Wholesale, BRRRR and Rental every time. Quick Scan uses ARV + rent only; optional records are loaded only when you request them. A result means the strategy meets or misses your configured thresholds; it is not a guarantee to buy or avoid the property.")
+    if effective_tax_match <= 0:
+        st.warning("Quick Scan currently has no annual property-tax amount. BRRRR/Rental cash flow may look stronger than reality. Enter a tax override in the Deal setup above or load the Property record.")
     st.markdown("#### Property & neighborhood snapshot")
     p1,p2,p3,p4=st.columns(4)
     with p1: result_card("ZIP code", zip_code)
@@ -2217,8 +2468,47 @@ with tabs[0]:
 
 with tabs[1]:
     st.markdown("#### Public-record property profile")
+    property_profile_fresh = bool(property_record) and snapshot_field_fresh(
+        A, "property_record_fetched_at", 180, value_key="property_record", fallback_to_time=True
+    )
+    if property_record:
+        st.caption("Optional deep data. This profile is reused for up to 180 days and is not required for Quick Scan.")
+        if st.button("Refresh property record (up to 1 RentCast call)", key="refresh_property_record"):
+            with st.spinner("Loading property record..."):
+                try:
+                    rec, rec_time = property_record_cached(A["address_key"], key, A["input"])
+                    A["property_record"] = rec or {}
+                    A["property_record_fetched_at"] = rec_time
+                    A["time"] = utc_now_iso()
+                    st.session_state["analysis"] = A
+                    db_merge_save_snapshot(A["address_key"], A["input"], {
+                        "property_record": rec or {},
+                        "property_record_fetched_at": rec_time,
+                    })
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+    else:
+        st.info("Quick Scan intentionally skipped the full public-record profile to save an API request.")
+        if st.button("Load full property record (up to 1 RentCast call)", type="primary", key="load_property_record"):
+            with st.spinner("Loading property record..."):
+                try:
+                    rec, rec_time = property_record_cached(A["address_key"], key, A["input"])
+                    A["property_record"] = rec or {}
+                    A["property_record_fetched_at"] = rec_time
+                    A["time"] = utc_now_iso()
+                    st.session_state["analysis"] = A
+                    db_merge_save_snapshot(A["address_key"], A["input"], {
+                        "property_record": rec or {},
+                        "property_record_fetched_at": rec_time,
+                    })
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+
+    property_record = A.get("property_record") or {}
     if not property_record:
-        st.info("No public-record property profile was returned for this address.")
+        st.caption("No property record loaded yet, or the provider did not return one.")
     else:
         owner = property_record.get("owner") or {}
         owner_names = owner.get("names") or []
@@ -2315,8 +2605,52 @@ with tabs[1]:
 
 with tabs[2]:
     st.markdown("#### Sale listing / market history")
+    listing_record = A.get("listing_record") or {}
+    listing_checked = bool(A.get("listing_record_fetched_at")) or bool(listing_record)
+    property_id_for_listing = (A.get("property_record") or {}).get("id") or (val.get("subjectProperty") or {}).get("id")
+
+    if not listing_checked:
+        st.info("Quick Scan intentionally skipped the exact listing lookup to save an API request.")
+        if property_id_for_listing:
+            if st.button("Load exact listing record (up to 1 RentCast call)", type="primary", key="load_listing_record"):
+                with st.spinner("Checking exact listing record..."):
+                    try:
+                        rec, rec_time = listing_record_cached(A["address_key"], key, property_id_for_listing)
+                        A["listing_record"] = rec or {}
+                        A["listing_record_fetched_at"] = rec_time
+                        A["time"] = utc_now_iso()
+                        st.session_state["analysis"] = A
+                        db_merge_save_snapshot(A["address_key"], A["input"], {
+                            "listing_record": rec or {},
+                            "listing_record_fetched_at": rec_time,
+                        })
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+        else:
+            st.caption("Load the Property record first so DealFinder can obtain the provider property ID for an exact listing lookup.")
+    else:
+        st.caption("Optional listing data is cached for 7 days. A 404/no listing does not count as a successful RentCast request in the app meter.")
+        if st.button("Refresh listing check (up to 1 RentCast call)", key="refresh_listing_record") and property_id_for_listing:
+            with st.spinner("Refreshing listing record..."):
+                try:
+                    rec, rec_time = listing_record_cached(A["address_key"], key, property_id_for_listing)
+                    A["listing_record"] = rec or {}
+                    A["listing_record_fetched_at"] = rec_time
+                    A["time"] = utc_now_iso()
+                    st.session_state["analysis"] = A
+                    db_merge_save_snapshot(A["address_key"], A["input"], {
+                        "listing_record": rec or {},
+                        "listing_record_fetched_at": rec_time,
+                    })
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+
+    listing_record = A.get("listing_record") or {}
     if not listing_record:
-        st.info("No exact sale-listing record was returned. The property may be off-market or may not have listing coverage.")
+        if listing_checked:
+            st.info("No exact sale-listing record was found. The property may be off-market or outside current listing coverage.")
     else:
         l1,l2,l3,l4=st.columns(4)
         with l1: result_card("Listing status", listing_record.get("status") or "—")
@@ -2365,7 +2699,7 @@ with tabs[2]:
 
 with tabs[3]:
     st.markdown("#### Deal math")
-    rows=[["ARV",arv],["Rehab",rehab],["Purchase/closing allowance",arv*closing/100],["Selling-cost allowance",arv*selling/100],["Holding + financing",holding],["Rehab contingency",rehab*contingency/100],["Target profit",target_profit if strategy in ("Flip","Wholesale") else None],["Assignment fee",assignment if strategy=="Wholesale" else None],["Offer ceiling",ceiling]]
+    rows=[["ARV",arv],["Rehab",rehab],["Acquisition closing @ offer ceiling",ceiling*closing/100],["Selling-cost allowance",arv*selling/100],["Holding + financing",holding],["Rehab contingency",rehab*contingency/100],["Target profit",target_profit if strategy in ("Flip","Wholesale") else None],["Assignment fee",assignment if strategy=="Wholesale" else None],["Offer ceiling",ceiling]]
     df=pd.DataFrame(rows,columns=["Item","Amount"]).dropna()
     st.dataframe(df.style.format({"Amount":"${:,.0f}"}),use_container_width=True,hide_index=True)
 
@@ -2387,6 +2721,9 @@ with tabs[4]:
     )
 
     latest_tax, latest_tax_year = latest_property_tax(property_record)
+    if not latest_tax and taxes_override_match:
+        latest_tax = float(taxes_override_match)
+        latest_tax_year = "manual"
     hoa_default = float(((property_record.get("hoa") or {}).get("fee")) or 0)
     listing_price = listing_record.get("price")
     default_purchase = float(ceiling or 0)
@@ -2739,13 +3076,25 @@ with tabs[6]:
     same_neighborhood = isinstance(n_state, dict) and n_state.get("address_key") == n_key
 
     if not same_neighborhood:
-        st.info("Load this only when you want the neighborhood map. It uses 2 additional RentCast requests for a new address and then caches the result for 30 days.")
+        st.info("Load this only when you want deeper neighborhood activity. A new snapshot uses up to 2 RentCast requests; a saved 30-day NORVIM snapshot uses 0.")
         if st.button("Load neighborhood map & recent sales", type="primary", use_container_width=True):
-            with st.spinner("Loading recent sales and active listings around the property..."):
+            with st.spinner("Checking permanent cache, then loading recent sales and active listings only if needed..."):
                 try:
-                    nsales, nactive, ntime = neighborhood_cached(
-                        n_key, key, A["input"], subj.get("propertyType")
-                    )
+                    neighborhood_db_key = f"neighborhood::{n_key}"
+                    saved = db_get_cached_snapshot(neighborhood_db_key, max_age_days=30) or {}
+                    if saved.get("recent_sales") is not None and saved.get("active_listings") is not None:
+                        nsales = saved.get("recent_sales") or []
+                        nactive = saved.get("active_listings") or []
+                        ntime = saved.get("time") or utc_now_iso()
+                    else:
+                        nsales, nactive, ntime = neighborhood_cached(
+                            n_key, key, A["input"], subj.get("propertyType")
+                        )
+                        db_save_snapshot(neighborhood_db_key, A["input"], {
+                            "recent_sales": nsales,
+                            "active_listings": nactive,
+                            "time": ntime,
+                        })
                     st.session_state["neighborhood_snapshot"] = {
                         "address_key": n_key,
                         "recent_sales": nsales,
@@ -2833,11 +3182,42 @@ with tabs[6]:
                 },na_rep="—"),
                 use_container_width=True,hide_index=True
             )
-        st.caption(f'Neighborhood snapshot saved: {n_state.get("time","—")}. Reopening this address reuses cached neighborhood data while the 30-day cache remains available.')
+        st.caption(f'Neighborhood snapshot saved: {n_state.get("time","—")}. With Supabase connected, reopening this address can reuse the permanent 30-day NORVIM snapshot without new RentCast calls.')
 
 
 with tabs[7]:
     st.markdown("#### ZIP / area market analysis")
+    if not market and zip_code != "—":
+        st.info("Quick Scan skipped the ZIP market endpoint. Load it only when you need market velocity, asking-price trends or ZIP-level rental statistics.")
+        if st.button("Load ZIP market data (up to 1 RentCast call)", type="primary", key="load_zip_market"):
+            with st.spinner(f"Loading ZIP {zip_code} market data..."):
+                try:
+                    zip_cache_key = f"zip::{zip_code}"
+                    cached_zip = db_get_cached_snapshot(zip_cache_key, max_age_days=30) or {}
+                    if cached_zip.get("market"):
+                        mkt = cached_zip.get("market") or {}
+                        mkt_time = cached_zip.get("market_fetched_at") or cached_zip.get("time") or utc_now_iso()
+                    else:
+                        mkt, mkt_time = market_zip_cached(zip_code, key)
+                        db_save_snapshot(zip_cache_key, f"ZIP {zip_code} market", {
+                            "market": mkt,
+                            "market_fetched_at": mkt_time,
+                            "time": mkt_time,
+                        })
+                    A["market"] = mkt
+                    A["market_fetched_at"] = mkt_time
+                    A["time"] = utc_now_iso()
+                    st.session_state["analysis"] = A
+                    db_merge_save_snapshot(A["address_key"], A["input"], {
+                        "market": mkt,
+                        "market_fetched_at": mkt_time,
+                    })
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+    elif market:
+        st.caption(f"ZIP market data is cached for 30 days and can be reused by other properties in ZIP {zip_code}.")
+
     st.write(
         f"**Area:** {property_record.get('subdivision') or 'Subdivision unavailable'} · "
         f"{subj.get('city') or property_record.get('city') or 'City unavailable'}, "
@@ -3036,7 +3416,7 @@ with tabs[11]:
         test_price, arv, rent_m, rehab, closing, selling, holding, contingency,
         target_profit, flip_min_roi, assignment,
         refi_ltv, refi_rate_match, refi_term_match, refi_closing_match,
-        latest_tax_match, insurance_match, hoa_match,
+        effective_tax_match, insurance_match, hoa_match,
         vacancy, management_match, maintenance_match, capex_match,
         brrrr_min_cf, brrrr_max_cash_left, min_dscr_global,
         rental_down, rental_rate, rental_term, rental_min_cf, cap,
@@ -3065,7 +3445,7 @@ with tabs[11]:
             p, arv, rent_m, rehab, closing, selling, holding, contingency,
             target_profit, flip_min_roi, assignment,
             refi_ltv, refi_rate_match, refi_term_match, refi_closing_match,
-            latest_tax_match, insurance_match, hoa_match,
+            effective_tax_match, insurance_match, hoa_match,
             vacancy, management_match, maintenance_match, capex_match,
             brrrr_min_cf, brrrr_max_cash_left, min_dscr_global,
             rental_down, rental_rate, rental_term, rental_min_cf, cap,
@@ -3247,4 +3627,4 @@ with tabs[13]:
             st.caption("No saved pipeline records yet.")
 
 
-st.caption("NORVIM DealFinder 2.0 · strategy matching, offer sensitivity, public-data intelligence, permanent-cache/CRM hooks and API usage tracking.")
+st.caption("NORVIM DealFinder 2.2 · 2-call Quick Scan, optional deep data, permanent caching, strategy matching, offer sensitivity, neighborhood intelligence and CRM.")
