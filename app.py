@@ -15,7 +15,7 @@ HCAD_PARCEL_URL = "https://www.gis.hctx.net/arcgis/rest/services/HCAD/Parcels/Ma
 NCES_SCHOOLS_URL = "https://nces.ed.gov/opengis/rest/services/K12_School_Locations/EDGE_GEOCODE_PUBLICSCH_2425/MapServer/0/query"
 HUD_FMR_API_BASE = "https://www.huduser.gov/hudapi/public/fmr"
 
-st.set_page_config(page_title="NORVIM DealFinder 2.5.1", page_icon="🏠", layout="wide")
+st.set_page_config(page_title="NORVIM DealFinder 2.5.2", page_icon="🏠", layout="wide")
 st.markdown("""
 <style>
 :root { color-scheme: light !important; }
@@ -553,7 +553,7 @@ def db_monthly_api_usage():
 
 def safe_public_get(url, params=None, timeout=18):
     try:
-        r = requests.get(url, params=params or {}, timeout=timeout, headers={"User-Agent": "NORVIM-DealFinder/2.5.1"})
+        r = requests.get(url, params=params or {}, timeout=timeout, headers={"User-Agent": "NORVIM-DealFinder/2.5.2"})
         if not r.ok:
             return {"_error": f"HTTP {r.status_code}"}
         data = r.json()
@@ -716,7 +716,13 @@ def get_hud_token():
 
 
 def hud_api_get(path, token, params=None, timeout=20):
-    """Call HUD USER without ever returning/logging the token."""
+    """Call HUD USER and normalize the small response-shape variations seen across endpoints.
+
+    HUD's documentation shows most FMR endpoints wrapped as {"data": ...}, but some
+    responses can arrive as a bare JSON list. NORVIM normalizes either shape to a
+    dictionary so downstream code does not fail just because the wrapper differs.
+    The access token is never returned or logged.
+    """
     if not token:
         return {"_error": "HUD_API_TOKEN is not configured.", "_status": 0}
     try:
@@ -724,7 +730,7 @@ def hud_api_get(path, token, params=None, timeout=20):
             f"{HUD_FMR_API_BASE}{path}",
             params=params or {},
             timeout=timeout,
-            headers={"Accept": "application/json", "Authorization": f"Bearer {token}", "User-Agent": "NORVIM-DealFinder/2.5.1"},
+            headers={"Accept": "application/json", "Authorization": f"Bearer {token}", "User-Agent": "NORVIM-DealFinder/2.5.2"},
         )
         if not r.ok:
             detail = ""
@@ -732,6 +738,8 @@ def hud_api_get(path, token, params=None, timeout=20):
                 payload = r.json()
                 if isinstance(payload, dict):
                     detail = str(payload.get("message") or payload.get("error") or payload.get("description") or "")
+                elif isinstance(payload, list) and payload and isinstance(payload[0], dict):
+                    detail = str(payload[0].get("message") or payload[0].get("error") or "")
             except Exception:
                 pass
             msg = f"HUD API HTTP {r.status_code}"
@@ -742,10 +750,36 @@ def hud_api_get(path, token, params=None, timeout=20):
             elif r.status_code == 403:
                 msg += " (token is valid but may not be registered for the FMR/IL Dataset API)"
             return {"_error": msg, "_status": int(r.status_code)}
-        data = r.json()
-        if not isinstance(data, dict):
-            return {"_error": "Unexpected HUD response format.", "_status": int(r.status_code)}
-        return data
+
+        try:
+            data = r.json()
+        except Exception:
+            ctype = str(r.headers.get("content-type") or "")
+            return {
+                "_error": f"HUD returned HTTP 200 but the body was not valid JSON (content-type: {ctype or 'unknown'}).",
+                "_status": int(r.status_code),
+            }
+
+        # Official HUD examples generally use {"data": ...}; normalize bare arrays
+        # returned by list-style endpoints to the same contract.
+        if isinstance(data, list):
+            return {"data": data, "_status": int(r.status_code), "_normalized_from": "list"}
+        if isinstance(data, dict):
+            # Some API gateways wrap the payload one level deeper in results/result.
+            if "data" not in data:
+                if isinstance(data.get("results"), (list, dict)):
+                    data = {**data, "data": data.get("results")}
+                elif isinstance(data.get("result"), (list, dict)):
+                    data = {**data, "data": data.get("result")}
+            data.setdefault("_status", int(r.status_code))
+            return data
+
+        return {
+            "_error": f"HUD returned an unsupported JSON type: {type(data).__name__}.",
+            "_status": int(r.status_code),
+        }
+    except requests.Timeout:
+        return {"_error": "HUD request timed out. Try again in a moment.", "_status": 0}
     except Exception as e:
         return {"_error": f"HUD request failed: {e}", "_status": 0}
 
@@ -761,8 +795,43 @@ def _hud_rents_from_row(row):
     }
 
 
+def _hud_get_ci(mapping, *names, default=None):
+    """Case-insensitive HUD field lookup for minor API/schema naming differences."""
+    if not isinstance(mapping, dict):
+        return default
+    lowered = {str(k).lower(): v for k, v in mapping.items()}
+    for name in names:
+        if name in mapping:
+            return mapping.get(name)
+        key = str(name).lower()
+        if key in lowered:
+            return lowered[key]
+    return default
+
+
+def _hud_data(payload):
+    """Return the useful HUD payload whether it is wrapped in data/results or already direct."""
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return {}
+    data = payload.get("data")
+    if isinstance(data, (dict, list)):
+        return data
+    for key in ("results", "result"):
+        val = payload.get(key)
+        if isinstance(val, (dict, list)):
+            return val
+    # Treat a direct HUD object as data, but do not treat error metadata as data.
+    if any(str(k).lower() in {"basicdata", "metroareas", "counties", "state_name", "state_code", "cbsa_code"} for k in payload):
+        return payload
+    return {}
+
+
 def _hud_basic_rows(data):
-    basic = (data or {}).get("basicdata") or []
+    if not isinstance(data, dict):
+        return []
+    basic = _hud_get_ci(data, "basicdata", "basic_data", "BasicData", default=[])
     if isinstance(basic, dict):
         return [basic]
     return basic if isinstance(basic, list) else []
@@ -793,8 +862,11 @@ def hud_houston_safmr(zip_code, token, year=2026):
                 return statewide
             continue
 
-        state_data = statewide.get("data") or {}
-        metros = state_data.get("metroareas") or []
+        state_data = _hud_data(statewide) or {}
+        if not isinstance(state_data, dict):
+            last_error = {"_error": "HUD Texas FMR payload was not an object after normalization."}
+            continue
+        metros = _hud_get_ci(state_data, "metroareas", "metro_areas", default=[]) or []
         candidates = [m for m in metros if "houston" in str(m.get("name") or "").lower()]
         candidates = sorted(
             candidates,
@@ -808,7 +880,7 @@ def hud_houston_safmr(zip_code, token, year=2026):
             # Fallback to the published metro list if statewide naming ever changes.
             metro_list = hud_api_get("/listMetroAreas", token, {})
             if not metro_list.get("_error"):
-                for m in metro_list.get("data") or []:
+                for m in (_hud_data(metro_list) or []):
                     if "houston" in str(m.get("area_name") or "").lower():
                         candidates.append({"code": m.get("cbsa_code"), "name": m.get("area_name")})
         if not candidates:
@@ -827,13 +899,16 @@ def hud_houston_safmr(zip_code, token, year=2026):
             if detail.get("_error"):
                 last_error = detail
                 continue
-            data = detail.get("data") or {}
+            data = _hud_data(detail) or {}
+            if not isinstance(data, dict):
+                last_error = {"_error": f"HUD FMR detail payload for {code} was not an object after normalization."}
+                continue
             rows = _hud_basic_rows(data)
             if not rows:
                 continue
 
-            exact = next((r for r in rows if str(r.get("zip_code") or "").strip() == z), None)
-            msa = next((r for r in rows if str(r.get("zip_code") or "").strip().lower() == "msa level"), None)
+            exact = next((r for r in rows if str(_hud_get_ci(r, "zip_code", "zipcode", "zip", default="") or "").strip() == z), None)
+            msa = next((r for r in rows if str(_hud_get_ci(r, "zip_code", "zipcode", "zip", default="") or "").strip().lower() == "msa level"), None)
             # Non-SAFMR metros often return a single basicdata object with no zip_code.
             generic = rows[0] if rows else None
             if exact:
@@ -890,30 +965,56 @@ def hud_reference_rent(profile, bedrooms):
 
 @st.cache_data(ttl=15 * 60, show_spinner=False)
 def hud_connection_test(token, zip_code="77022", year=2026):
-    """Sanitized connectivity test; never returns the token."""
-    result = {"token_present": bool(token), "zip": str(zip_code or "")[:5], "requested_year": int(year)}
+    """Sanitized Houston-focused HUD validation; never returns or logs the token."""
+    z = re.sub(r"\D", "", str(zip_code or ""))[:5] or "77022"
+    result = {"token_present": bool(token), "zip": z, "requested_year": int(year)}
     if not token:
         result.update({"ok": False, "message": "HUD_API_TOKEN is not configured."})
         return result
-    states = hud_api_get("/listStates", token, {})
-    if states.get("_error"):
-        result.update({"ok": False, "message": states.get("_error"), "status": states.get("_status")})
+
+    # Validate directly against the FMR dataset the app actually uses instead of
+    # depending on /listStates, whose top-level JSON wrapper can vary.
+    texas = hud_api_get("/statedata/TX", token, {"year": int(year)})
+    if texas.get("_error"):
+        result.update({"ok": False, "message": texas.get("_error"), "status": texas.get("_status")})
         return result
-    profile = hud_houston_safmr(zip_code, token, year)
+
+    texas_data = _hud_data(texas)
+    if not isinstance(texas_data, dict):
+        result.update({
+            "ok": False,
+            "message": "HUD authentication worked, but the Texas FMR response shape could not be read. NORVIM normalized the response but did not find a state-data object.",
+            "status": texas.get("_status"),
+        })
+        return result
+
+    profile = hud_houston_safmr(z, token, year)
     if profile.get("_error"):
         result.update({"ok": False, "message": profile.get("_error"), "status": profile.get("_status")})
         return result
+
+    sample = hud_reference_rent(profile, 2)
+    if sample <= 0:
+        result.update({
+            "ok": False,
+            "message": "HUD connected, but the returned Houston profile did not contain a usable 2-bedroom FMR/SAFMR value.",
+            "status": 200,
+        })
+        return result
+
     result.update({
         "ok": True,
-        "message": "HUD connection is working.",
+        "message": "HUD FMR API connected.",
+        "status": 200,
         "scope": profile.get("source_scope"),
         "year": profile.get("year"),
-        "area": profile.get("area_name"),
-        "hud_code": profile.get("hud_code"),
-        "sample_2br": profile.get("2br"),
+        "sample_2br": sample,
         "exact_zip": bool(profile.get("exact_zip")),
+        "area_name": profile.get("area_name"),
+        "hud_code": profile.get("hud_code"),
     })
     return result
+
 
 def census_zip_profile(zip_code, census_key):
     if not zip_code or not census_key:
@@ -2748,7 +2849,7 @@ def history_df(data):
                 })
     return pd.DataFrame(rows).sort_values("Period") if rows else pd.DataFrame()
 
-st.markdown('<div class="k">NORVIM 13 LLC</div><div class="t">DealFinder 2.5.1</div><div class="s">Automatic Analysis → active Area Scout + free Off-Market Map → cache-first or 0-call underwriting → pipeline.</div>', unsafe_allow_html=True)
+st.markdown('<div class="k">NORVIM 13 LLC</div><div class="t">DealFinder 2.5.2</div><div class="s">Automatic Analysis → active Area Scout + free Off-Market Map → cache-first or 0-call underwriting → pipeline.</div>', unsafe_allow_html=True)
 
 
 app_access_code = str(get_setting("APP_ACCESS_CODE", "") or "").strip()
@@ -4735,6 +4836,7 @@ with tabs[8]:
 with tabs[9]:
     st.markdown("#### Section 8 / Housing Choice Voucher underwriting")
     st.caption("Uses HUD FY2026 Fair Market Rent / Small Area FMR as a reference point. Actual PHA payment standards, utility allowances, rent reasonableness and approved contract rent can differ.")
+    st.caption("HUD connection test now validates the same Texas/Houston FMR endpoint used by the analyzer and accepts HUD's documented object or list response wrappers.")
     hud_token = get_hud_token()
     hud_profile = hud_houston_safmr(zip_code, hud_token, 2026) if hud_token and zip_code != "—" else {}
     subject_beds = subj.get("bedrooms") or property_record.get("bedrooms") or 2
@@ -5162,4 +5264,4 @@ with tabs[14]:
             st.caption("No saved pipeline records yet.")
 
 
-st.caption("NORVIM DealFinder 2.5.1 · active + off-market scouting · HUD diagnostics · cache-first automatic analysis + 0-call Manual / Free Mode · strategy matching · neighborhood intelligence · CRM.")
+st.caption("NORVIM DealFinder 2.5.2 · active + off-market scouting · HUD diagnostics · cache-first automatic analysis + 0-call Manual / Free Mode · strategy matching · neighborhood intelligence · CRM.")
