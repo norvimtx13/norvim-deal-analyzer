@@ -10,8 +10,12 @@ import pydeck as pdk
 
 API_BASE = "https://api.rentcast.io/v1"
 CACHE_TTL_SECONDS = 30 * 24 * 60 * 60  # 30 days
+AREA_SCAN_TTL_DAYS = 1
+HCAD_PARCEL_URL = "https://www.gis.hctx.net/arcgis/rest/services/HCAD/Parcels/MapServer/0/query"
+NCES_SCHOOLS_URL = "https://nces.ed.gov/opengis/rest/services/K12_School_Locations/EDGE_GEOCODE_PUBLICSCH_2425/MapServer/0/query"
+HUD_FMR_API_BASE = "https://www.huduser.gov/hudapi/public/fmr"
 
-st.set_page_config(page_title="NORVIM DealFinder 2.2", page_icon="🏠", layout="wide")
+st.set_page_config(page_title="NORVIM DealFinder 2.4", page_icon="🏠", layout="wide")
 st.markdown("""
 <style>
 :root { color-scheme: light !important; }
@@ -549,7 +553,7 @@ def db_monthly_api_usage():
 
 def safe_public_get(url, params=None, timeout=18):
     try:
-        r = requests.get(url, params=params or {}, timeout=timeout, headers={"User-Agent": "NORVIM-DealFinder/2.2"})
+        r = requests.get(url, params=params or {}, timeout=timeout, headers={"User-Agent": "NORVIM-DealFinder/2.4"})
         if not r.ok:
             return {"_error": f"HTTP {r.status_code}"}
         data = r.json()
@@ -630,6 +634,166 @@ def summarize_plats(features):
     return pd.DataFrame(rows)
 
 
+
+def _date_from_epoch_ms(value):
+    try:
+        return datetime.fromtimestamp(float(value) / 1000, tz=timezone.utc).date().isoformat()
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=30 * 24 * 60 * 60, show_spinner=False)
+def hcad_parcel_by_point(lat, lon):
+    """Free Harris County parcel lookup by subject coordinates."""
+    if lat is None or lon is None:
+        return {}
+    payload = safe_public_get(
+        HCAD_PARCEL_URL,
+        {
+            "where": "1=1",
+            "geometry": f"{lon},{lat}",
+            "geometryType": "esriGeometryPoint",
+            "inSR": 4326,
+            "spatialRel": "esriSpatialRelIntersects",
+            "outFields": (
+                "acct_num,tax_year,owner_name_1,owner_name_2,mail_addr_1,mail_addr_2,mail_city,mail_state,mail_zip,"
+                "site_str_num,site_str_name,site_str_sfx,site_city,site_zip,land_value,bld_value,impr_value,"
+                "total_appraised_val,total_market_val,tax_value,new_owner_date,legal_dscr_1,legal_dscr_2,"
+                "acreage_1,land_sqft,state_class,land_use,nh_cd,dscr"
+            ),
+            "returnGeometry": "false",
+            "resultRecordCount": 1,
+            "f": "json",
+        },
+    )
+    if not isinstance(payload, dict) or payload.get("_error"):
+        return {}
+    feats = payload.get("features") or []
+    attrs = (feats[0].get("attributes") or {}) if feats else {}
+    if attrs.get("new_owner_date") not in (None, ""):
+        attrs["new_owner_date_iso"] = _date_from_epoch_ms(attrs.get("new_owner_date"))
+    return attrs
+
+
+@st.cache_data(ttl=30 * 24 * 60 * 60, show_spinner=False)
+def nces_schools_nearby(lat, lon, miles=3.0, limit=20):
+    """Nearest public-school locations from NCES EDGE; no rating is inferred."""
+    if lat is None or lon is None:
+        return []
+    payload = safe_public_get(
+        NCES_SCHOOLS_URL,
+        {
+            "where": "1=1",
+            "geometry": f"{lon},{lat}",
+            "geometryType": "esriGeometryPoint",
+            "inSR": 4326,
+            "spatialRel": "esriSpatialRelIntersects",
+            "distance": round(float(miles) * 1609.344, 1),
+            "units": "esriSRUnit_Meter",
+            "outFields": "NAME,STREET,CITY,STATE,ZIP,LAT,LON,SCHOOLYEAR",
+            "returnGeometry": "false",
+            "resultRecordCount": int(limit),
+            "f": "json",
+        },
+    )
+    if not isinstance(payload, dict) or payload.get("_error"):
+        return []
+    rows = []
+    for feat in payload.get("features") or []:
+        a = feat.get("attributes") or {}
+        d = haversine_miles(lat, lon, a.get("LAT"), a.get("LON"))
+        rows.append({
+            "School": a.get("NAME"),
+            "Address": " ".join([str(x) for x in [a.get("STREET"), a.get("CITY"), a.get("STATE"), a.get("ZIP")] if x]),
+            "Distance (mi)": d,
+            "School year": a.get("SCHOOLYEAR"),
+        })
+    return sorted(rows, key=lambda r: r.get("Distance (mi)") if r.get("Distance (mi)") is not None else 999)
+
+
+def get_hud_token():
+    return str(get_setting("HUD_API_TOKEN", "") or "").strip()
+
+
+def hud_api_get(path, token, params=None, timeout=20):
+    if not token:
+        return {"_error": "HUD_API_TOKEN is not configured."}
+    try:
+        r = requests.get(
+            f"{HUD_FMR_API_BASE}{path}",
+            params=params or {},
+            timeout=timeout,
+            headers={"Accept": "application/json", "Authorization": f"Bearer {token}", "User-Agent": "NORVIM-DealFinder/2.4"},
+        )
+        if not r.ok:
+            return {"_error": f"HUD API HTTP {r.status_code}"}
+        data = r.json()
+        return data if isinstance(data, dict) else {"_error": "Unexpected HUD response."}
+    except Exception as e:
+        return {"_error": str(e)}
+
+
+@st.cache_data(ttl=7 * 24 * 60 * 60, show_spinner=False)
+def hud_houston_safmr(zip_code, token, year=2026):
+    """Get HUD FY Small Area FMR reference rents for a Houston-area ZIP.
+
+    HUD's API exposes SAFMR ZIP rows inside a HUD metro-area response. We first find
+    the Houston HUD metro code from Texas statewide data, then select the requested ZIP.
+    """
+    z = str(zip_code or "").strip()[:5]
+    if not z or not token:
+        return {}
+    statewide = hud_api_get("/statedata/TX", token, {"year": int(year)})
+    if statewide.get("_error"):
+        return {"_error": statewide.get("_error")}
+    metros = ((statewide.get("data") or {}).get("metroareas") or [])
+    candidates = [m for m in metros if "houston" in str(m.get("name") or "").lower()]
+    # Prefer the Houston-The Woodlands-Sugar Land HUD Metro FMR Area if present.
+    candidates = sorted(candidates, key=lambda m: ("woodlands" not in str(m.get("name") or "").lower(), str(m.get("name") or "")))
+    if not candidates:
+        return {"_error": "Houston HUD metro area was not found in HUD state data."}
+    metro = candidates[0]
+    code = metro.get("code")
+    detail = hud_api_get(f"/data/{code}", token, {"year": int(year)}) if code else {"_error": "HUD metro code missing."}
+    if detail.get("_error"):
+        return {"_error": detail.get("_error")}
+    data = detail.get("data") or {}
+    basic = data.get("basicdata") or []
+    if isinstance(basic, dict):
+        basic = [basic]
+    zip_row = next((r for r in basic if str(r.get("zip_code") or "") == z), None)
+    msa_row = next((r for r in basic if str(r.get("zip_code") or "").lower() == "msa level"), None)
+    row = zip_row or msa_row or (basic[0] if basic else {})
+    if not row:
+        return {"_error": f"No HUD FMR row returned for ZIP {z}."}
+    return {
+        "zip_code": z,
+        "source_scope": "ZIP SAFMR" if zip_row else "Metro FMR fallback",
+        "area_name": data.get("area_name") or data.get("metro_name") or metro.get("name"),
+        "year": data.get("year") or str(year),
+        "efficiency": parse_money_input(row.get("Efficiency"), 0),
+        "1br": parse_money_input(row.get("One-Bedroom"), 0),
+        "2br": parse_money_input(row.get("Two-Bedroom"), 0),
+        "3br": parse_money_input(row.get("Three-Bedroom"), 0),
+        "4br": parse_money_input(row.get("Four-Bedroom"), 0),
+    }
+
+
+def hud_reference_rent(profile, bedrooms):
+    if not profile or profile.get("_error"):
+        return 0.0
+    try:
+        b = int(round(float(bedrooms or 0)))
+    except Exception:
+        b = 0
+    if b <= 0:
+        key = "efficiency"
+    elif b >= 4:
+        key = "4br"
+    else:
+        key = f"{b}br"
+    return float(profile.get(key) or 0)
+
 def census_zip_profile(zip_code, census_key):
     if not zip_code or not census_key:
         return {}
@@ -686,7 +850,7 @@ def census_zip_profile(zip_code, census_key):
 
 @st.cache_data(ttl=7 * 24 * 60 * 60, show_spinner=False)
 def public_intelligence_cached(address_key, lat, lon, zip_code, census_key):
-    result = {"flood": {}, "311": [], "plat_apps": [], "final_plats": [], "census": {}, "fetched_at": utc_now_iso()}
+    result = {"flood": {}, "311": [], "plat_apps": [], "final_plats": [], "census": {}, "hcad": {}, "schools": [], "fetched_at": utc_now_iso()}
     if lat is None or lon is None:
         return result
 
@@ -721,6 +885,8 @@ def public_intelligence_cached(address_key, lat, lon, zip_code, census_key):
     )
     if census_key:
         result["census"] = census_zip_profile(zip_code, census_key)
+    result["hcad"] = hcad_parcel_by_point(lat, lon)
+    result["schools"] = nces_schools_nearby(lat, lon, 3.0, 20)
     return result
 
 def get_key():
@@ -782,6 +948,35 @@ def normalize_address(address):
     return " ".join(cleaned.split())
 
 
+def resolved_property_address(analysis):
+    """Prefer the full address RentCast resolved during Quick Scan for optional deep-data calls.
+
+    This lets a user type a short address such as "14826 W Lime Blossom Ct" once.
+    If the AVM resolves it to a complete city/state/ZIP address, later property/neighborhood
+    endpoints receive that canonical address instead of the incomplete user input.
+    """
+    analysis = analysis or {}
+    valuation = analysis.get("valuation") or {}
+    subject = valuation.get("subjectProperty") or {}
+
+    formatted = str(subject.get("formattedAddress") or "").strip()
+    if formatted:
+        return formatted
+
+    street = str(subject.get("addressLine1") or subject.get("address") or "").strip()
+    city = str(subject.get("city") or "").strip()
+    state = str(subject.get("state") or "").strip()
+    zip_code = str(subject.get("zipCode") or "").strip()
+    city_state_zip = " ".join(x for x in [state, zip_code] if x).strip()
+    locality = ", ".join(x for x in [city, city_state_zip] if x).strip()
+    if street and locality:
+        return f"{street}, {locality}"
+    if street:
+        return street
+
+    return str(analysis.get("input") or "").strip()
+
+
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def quick_scan_cached(address_key, key, _address_for_api):
     """Default scan: exactly two RentCast endpoints — value AVM and long-term rent AVM."""
@@ -829,6 +1024,189 @@ def market_zip_cached(zip_code, key):
     market = api_get("/markets", {"zipCode": str(zip_code), "dataType": "All", "historyRange": 12}, key, f"zip::{zip_code}")
     return market or {}, utc_now_iso()
 
+
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def area_listings_cached(zip_code, key, property_type, bedroom_filter, max_price, days_old, limit):
+    params = {
+        "zipCode": str(zip_code),
+        "status": "Active",
+        "limit": int(limit),
+    }
+    if property_type == "Any residential":
+        params["propertyType"] = "Single Family|Townhouse|Condo|Multi-Family|Manufactured"
+    elif property_type:
+        params["propertyType"] = property_type
+    if bedroom_filter:
+        params["bedrooms"] = bedroom_filter
+    if max_price and float(max_price) > 0:
+        params["price"] = f"0:{int(float(max_price))}"
+    if days_old and int(days_old) > 0:
+        params["daysOld"] = f"1:{int(days_old)}"
+    records = api_get("/listings/sale", params, key, f"area::{zip_code}")
+    return records or [], utc_now_iso()
+
+
+def _area_cache_key(zip_code, property_type, bedroom_filter, max_price, days_old, limit):
+    raw = f"area::{zip_code}::{property_type}::{bedroom_filter}::{int(max_price or 0)}::{int(days_old or 0)}::{int(limit)}"
+    return normalize_address(raw)
+
+
+def get_area_listings(zip_code, key, property_type, bedroom_filter, max_price, days_old, limit):
+    """One RentCast call per ZIP when the 24-hour NORVIM cache is stale."""
+    cache_key = _area_cache_key(zip_code, property_type, bedroom_filter, max_price, days_old, limit)
+    snap = db_get_cached_snapshot(cache_key, max_age_days=AREA_SCAN_TTL_DAYS) or {}
+    if isinstance(snap.get("area_listings"), list):
+        return snap.get("area_listings") or [], snap.get("time") or snap.get("fetched_at"), "NORVIM cache"
+    records, fetched_at = area_listings_cached(zip_code, key, property_type, bedroom_filter, max_price, days_old, limit)
+    db_save_snapshot(
+        cache_key,
+        f"Area scan ZIP {zip_code}",
+        {
+            "area_listings": records,
+            "area_zip": str(zip_code),
+            "area_filters": {
+                "property_type": property_type,
+                "bedrooms": bedroom_filter,
+                "max_price": max_price,
+                "days_old": days_old,
+                "limit": limit,
+            },
+            "time": fetched_at,
+        },
+    )
+    return records, fetched_at, "RentCast"
+
+
+def listing_days_on_market(record):
+    if record.get("daysOnMarket") not in (None, ""):
+        try:
+            return int(float(record.get("daysOnMarket")))
+        except Exception:
+            pass
+    raw = record.get("listedDate") or record.get("listingDate")
+    if raw:
+        try:
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            return max(int((datetime.now(timezone.utc) - dt).total_seconds() / 86400), 0)
+        except Exception:
+            pass
+    return None
+
+
+def area_listing_df(records):
+    rows = []
+    for r in records or []:
+        price = r.get("price") or r.get("listedPrice")
+        sqft = r.get("squareFootage")
+        hoa = ((r.get("hoa") or {}).get("fee")) if isinstance(r.get("hoa"), dict) else None
+        rows.append({
+            "Listing ID": r.get("id"),
+            "Address": r.get("formattedAddress"),
+            "ZIP": str(r.get("zipCode") or ""),
+            "Price": price,
+            "Beds": r.get("bedrooms"),
+            "Baths": r.get("bathrooms"),
+            "Sq Ft": sqft,
+            "$/Sq Ft": (float(price) / float(sqft) if price and sqft else None),
+            "DOM": listing_days_on_market(r),
+            "Property Type": r.get("propertyType"),
+            "Year Built": r.get("yearBuilt"),
+            "HOA / mo": hoa,
+            "Latitude": r.get("latitude"),
+            "Longitude": r.get("longitude"),
+        })
+    return pd.DataFrame(rows)
+
+
+def score_area_candidates(df, strategy, hud_profiles=None, finance=None):
+    """Preliminary area-screen score. It is intentionally not an ARV or appraisal."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    valid_ppsf = pd.to_numeric(out["$/Sq Ft"], errors="coerce")
+    median_ppsf = float(valid_ppsf.median()) if valid_ppsf.notna().any() else None
+    hud_profiles = hud_profiles or {}
+    finance = finance or {}
+    scores, notes, hud_rents, s8_cf = [], [], [], []
+    for _, row in out.iterrows():
+        ppsf = row.get("$/Sq Ft")
+        dom = row.get("DOM")
+        score = 45.0
+        note_parts = []
+        if median_ppsf and pd.notna(ppsf):
+            discount = (median_ppsf - float(ppsf)) / median_ppsf
+            score += max(min(discount * 120, 30), -25)
+            if discount >= 0.10:
+                note_parts.append(f"{discount*100:.0f}% below area median $/sf")
+        if pd.notna(dom):
+            dom = float(dom)
+            score += min(max(dom - 20, 0) / 4, 20)
+            if dom >= 60:
+                note_parts.append(f"{dom:.0f} DOM")
+        hud_rent = 0.0
+        cf = None
+        if strategy == "Section 8":
+            profile = hud_profiles.get(str(row.get("ZIP") or "")) or {}
+            hud_rent = hud_reference_rent(profile, row.get("Beds"))
+            if hud_rent > 0 and row.get("Price"):
+                purchase = float(row.get("Price") or 0)
+                taxes = purchase * float(finance.get("tax_rate_pct", 2.3) or 0) / 100
+                model = rental_buy_hold_model(
+                    purchase,
+                    max(hud_rent * float(finance.get("payment_standard_pct", 100) or 100) / 100 - float(finance.get("utility_allowance", 0) or 0), 0),
+                    float(finance.get("rehab", 0) or 0),
+                    float(finance.get("closing_pct", 2.0) or 0),
+                    float(finance.get("down_pct", 20.0) or 0),
+                    float(finance.get("rate_pct", 7.5) or 0),
+                    int(finance.get("term_years", 30) or 30),
+                    taxes,
+                    float(finance.get("annual_insurance", 3000) or 0),
+                    float(row.get("HOA / mo") or 0),
+                    float(finance.get("vacancy_pct", 5.0) or 0),
+                    float(finance.get("management_pct", 8.0) or 0),
+                    float(finance.get("maintenance_pct", 5.0) or 0),
+                    float(finance.get("capex_pct", 5.0) or 0),
+                    0,
+                )
+                cf = model.get("cash_flow")
+                score += max(min(float(cf or 0) / 20, 25), -30)
+                note_parts.append(f"HUD ref {money(hud_rent)}/mo")
+        hud_rents.append(hud_rent if hud_rent else None)
+        s8_cf.append(cf)
+        scores.append(max(min(round(score), 100), 0))
+        notes.append(" · ".join(note_parts) if note_parts else "Review price, condition and comps")
+    out["Screen Score"] = scores
+    out["Why it surfaced"] = notes
+    if strategy == "Section 8":
+        out["HUD Ref Rent"] = hud_rents
+        out["Est. S8 Cash Flow"] = s8_cf
+    return out.sort_values(["Screen Score", "DOM"], ascending=[False, False], na_position="last").reset_index(drop=True)
+
+
+def enrich_area_hcad(df, max_rows=15):
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    owner, hcad_market, hcad_appraised, hcad_land, hcad_account = [], [], [], [], []
+    for i, row in out.iterrows():
+        parcel = {}
+        if i < int(max_rows):
+            parcel = hcad_parcel_by_point(row.get("Latitude"), row.get("Longitude")) or {}
+        owner.append(parcel.get("owner_name_1"))
+        hcad_market.append(parcel.get("total_market_val"))
+        hcad_appraised.append(parcel.get("total_appraised_val"))
+        hcad_land.append(parcel.get("land_sqft"))
+        hcad_account.append(parcel.get("acct_num"))
+    out["HCAD Owner"] = owner
+    out["HCAD Market Value"] = hcad_market
+    out["HCAD Appraised"] = hcad_appraised
+    out["HCAD Land Sq Ft"] = hcad_land
+    out["HCAD Account"] = hcad_account
+    out["Ask / HCAD Market"] = [
+        (float(p) / float(v) if p not in (None, "") and v not in (None, "", 0) else None)
+        for p, v in zip(out["Price"], out["HCAD Market Value"])
+    ]
+    return out
 
 
 def haversine_miles(lat1, lon1, lat2, lon2):
@@ -1757,6 +2135,7 @@ def strategy_match(
     vacancy, management, maintenance, capex_reserve,
     brrrr_min_cf, brrrr_max_cash_left, min_dscr,
     rental_down, rental_rate, rental_term, rental_min_cf, rental_target_cap,
+    section8_rent=None, section8_min_cf=None, section8_target_cap=None,
 ):
     flip = flip_scenario(purchase_price, arv, rehab, closing, selling, holding, contingency)
     flip_pass = flip["profit"] >= flip_target_profit and (flip["roi"] or -999) >= flip_min_roi / 100
@@ -1803,6 +2182,25 @@ def strategy_match(
     ]
     rental_pass = all(rental_checks)
 
+    section8 = None
+    section8_checks = []
+    section8_pass = False
+    if section8_rent not in (None, 0):
+        section8 = rental_buy_hold_model(
+            purchase_price, section8_rent, rehab, closing, rental_down, rental_rate, rental_term,
+            annual_taxes, annual_insurance, monthly_hoa,
+            vacancy, management, maintenance, capex_reserve, 0
+        )
+        section8_cf_target = float(section8_min_cf if section8_min_cf is not None else rental_min_cf)
+        section8_cap_target = float(section8_target_cap if section8_target_cap is not None else rental_target_cap)
+        section8_checks = [
+            section8["cash_flow"] >= section8_cf_target,
+            section8.get("dscr") is not None and section8["dscr"] >= min_dscr,
+            section8.get("cap_rate") is not None and section8["cap_rate"] >= section8_cap_target / 100,
+        ]
+        section8_pass = all(section8_checks)
+        section8["underwriting_rent"] = float(section8_rent or 0)
+
     def status(checks, passed):
         count = sum(bool(x) for x in checks)
         if passed:
@@ -1815,6 +2213,10 @@ def strategy_match(
     ws, wk, wscore = status(wholesale_checks, wholesale_pass)
     bs, bk, bscore = status(brrrr_checks, brrrr_pass)
     rs, rk, rscore = status(rental_checks, rental_pass)
+    if section8 is not None:
+        s8s, s8k, s8score = status(section8_checks, section8_pass)
+    else:
+        s8s, s8k, s8score = "Needs HUD/manual rent", "warn", 0
 
     rows = [
         {
@@ -1846,6 +2248,14 @@ def strategy_match(
             "details": rental,
         },
     ]
+    if section8 is not None:
+        rows.append({
+            "strategy": "Section 8", "status": s8s, "kind": s8k, "score": s8score, "max_score": len(section8_checks),
+            "primary": section8["cash_flow"], "primary_label": "Monthly cash flow",
+            "secondary": section8["cap_rate"], "secondary_label": "Cap rate",
+            "max_purchase": offer_math("Rental", arv, section8_rent, rehab, closing, selling, holding, contingency, flip_target_profit, wholesale_fee_target, refi_ltv, vacancy, 35, section8_target_cap if section8_target_cap is not None else rental_target_cap)[0],
+            "details": section8,
+        })
     # Rank by comparable, strategy-specific threshold strength rather than raw dollars.
     # This prevents a $40k flip profit from being mechanically compared with $400/mo BRRRR cash flow.
     for row in rows:
@@ -1865,9 +2275,11 @@ def strategy_match(
             equity_strength = 1.5 if d.get("equity_created_vs_cost", 0) > 0 else 0
             row["strength"] = (min(cf_strength, 2.0) + min(dscr_strength, 2.0) + cash_left_strength + equity_strength) / 4
         else:
-            cf_strength = max(d.get("cash_flow", 0), 0) / max(float(rental_min_cf or 1), 1)
+            cf_target = section8_min_cf if row["strategy"] == "Section 8" and section8_min_cf is not None else rental_min_cf
+            cap_target = section8_target_cap if row["strategy"] == "Section 8" and section8_target_cap is not None else rental_target_cap
+            cf_strength = max(d.get("cash_flow", 0), 0) / max(float(cf_target or 1), 1)
             dscr_strength = max(d.get("dscr") or 0, 0) / max(float(min_dscr or 1), 0.01)
-            cap_strength = max(d.get("cap_rate") or 0, 0) / max(float(rental_target_cap or 1) / 100, 0.0001)
+            cap_strength = max(d.get("cap_rate") or 0, 0) / max(float(cap_target or 1) / 100, 0.0001)
             row["strength"] = (min(cf_strength, 2.0) + min(dscr_strength, 2.0) + min(cap_strength, 2.0)) / 3
     rows = sorted(rows, key=lambda r: (r["passed"], r["fit_ratio"], r.get("strength", 0)), reverse=True)
     return rows
@@ -1892,9 +2304,10 @@ def strategy_explanation(row):
     if s == "BRRRR":
         dscr = d.get("dscr")
         return f"{money(d.get('monthly_cash_flow'))}/mo cash flow · {money(d.get('cash_left'))} cash left · {money(d.get('equity_after_refi'))} equity" + (f" · {dscr:.2f}x rent cushion" if dscr is not None else "")
-    if s == "Rental":
+    if s in ("Rental", "Section 8"):
         dscr = d.get("dscr")
-        return f"{money(d.get('cash_flow'))}/mo cash flow" + (f" · {d.get('cap_rate')*100:.2f}% cap rate" if d.get("cap_rate") is not None else "") + (f" · {dscr:.2f}x rent cushion" if dscr is not None else "")
+        rent_note = f" · {money(d.get('underwriting_rent'))}/mo underwriting rent" if s == "Section 8" and d.get("underwriting_rent") else ""
+        return f"{money(d.get('cash_flow'))}/mo cash flow" + (f" · {d.get('cap_rate')*100:.2f}% cap rate" if d.get("cap_rate") is not None else "") + (f" · {dscr:.2f}x rent cushion" if dscr is not None else "") + rent_note
     return ""
 
 
@@ -2007,7 +2420,7 @@ def history_df(data):
                 })
     return pd.DataFrame(rows).sort_values("Period") if rows else pd.DataFrame()
 
-st.markdown('<div class="k">NORVIM 13 LLC</div><div class="t">DealFinder 2.2</div><div class="s">2-call Quick Scan → strategy match → optional deep research → pipeline.</div>', unsafe_allow_html=True)
+st.markdown('<div class="k">NORVIM 13 LLC</div><div class="t">DealFinder 2.4</div><div class="s">Automatic Analysis → Area Deal Scout → 2-call deep underwriting → pipeline.</div>', unsafe_allow_html=True)
 
 
 app_access_code = str(get_setting("APP_ACCESS_CODE", "") or "").strip()
@@ -2056,16 +2469,230 @@ with st.sidebar:
         st.info("Database not connected")
         st.caption("The app still works. Add Supabase later for permanent caching, CRM history and scaling.")
 
+
+# -----------------------------------------------------------------------------
+# AUTOMATIC ANALYSIS WORKFLOW
+# -----------------------------------------------------------------------------
+if "workflow_mode" not in st.session_state:
+    st.session_state["workflow_mode"] = "Analyze Property"
+workflow_mode = st.radio(
+    "Automatic analysis",
+    ["Analyze Property", "Find Deals by Area"],
+    horizontal=True,
+    key="workflow_mode",
+    help="Analyze one address deeply, or scan an area first and then open the strongest candidates in the full analyzer.",
+)
+
+if workflow_mode == "Find Deals by Area":
+    st.markdown("### Area Deal Scout")
+    st.caption(
+        "Screen active listings by ZIP before spending ARV/rent calls on individual properties. "
+        "A fresh area scan uses 1 RentCast listing request per ZIP; cached scans use 0. HCAD, HUD and NCES data are free/public sources."
+    )
+
+    with st.container(border=True):
+        preset_map = {
+            "Custom ZIPs": "",
+            "Sunnyside focus": "77051",
+            "Independence Heights focus": "77018, 77022",
+            "77022": "77022",
+            "77021": "77021",
+            "77020": "77020",
+            "77051": "77051",
+            "77033": "77033",
+        }
+        a0, a1, a2, a3 = st.columns([1.15, 1.35, 1.05, 1.05])
+        with a0:
+            scout_preset = st.selectbox("Area preset", list(preset_map.keys()), key="scout_area_preset")
+        with a1:
+            if scout_preset == "Custom ZIPs":
+                scout_zips_raw = st.text_input(
+                    "ZIP code(s)",
+                    value=st.session_state.get("scout_zips", "77022"),
+                    key="scout_zips",
+                    help="Enter one or more 5-digit ZIP codes separated by commas. Example: 77022, 77021, 77051",
+                )
+            else:
+                scout_zips_raw = preset_map[scout_preset]
+                st.text_input("ZIPs used", value=scout_zips_raw, disabled=True, key=f"preset_{scout_preset}")
+                st.caption("Neighborhood presets are ZIP-based screening shortcuts, not exact neighborhood boundaries.")
+        with a2:
+            scout_strategy = st.selectbox(
+                "Strategy to screen for",
+                ["Flip", "Wholesale", "BRRRR", "Rental", "Section 8"],
+                key="scout_strategy",
+            )
+        with a3:
+            scout_type = st.selectbox(
+                "Property type",
+                ["Single Family", "Townhouse", "Condo", "Multi-Family", "Manufactured", "Any residential"],
+                key="scout_property_type",
+            )
+
+        a4, a5, a6, a7 = st.columns(4)
+        with a4:
+            scout_max_price = money_input("Maximum asking price ($)", 300000, key="scout_max_price")
+        with a5:
+            scout_beds = st.text_input("Bedrooms", value="2:4", key="scout_beds", help="RentCast range syntax, e.g. 2:4 or 3.")
+        with a6:
+            scout_days = st.selectbox("Listed within", [30, 60, 90, 180, 365], index=3, key="scout_days")
+        with a7:
+            scout_limit = st.selectbox("Listings per ZIP", [25, 50, 75, 100], index=1, key="scout_limit")
+
+        scout_finance = {}
+        if scout_strategy == "Section 8":
+            st.markdown("##### Section 8 screening assumptions")
+            s81, s82, s83, s84 = st.columns(4)
+            with s81:
+                scout_finance["down_pct"] = st.number_input("Down payment (%)", 0.0, 100.0, 20.0, 1.0, key="scout_s8_down")
+            with s82:
+                scout_finance["rate_pct"] = st.number_input("Loan rate (%)", 0.0, 25.0, 7.5, 0.25, key="scout_s8_rate")
+            with s83:
+                scout_finance["rehab"] = money_input("Rehab allowance ($)", 20000, key="scout_s8_rehab")
+            with s84:
+                scout_finance["tax_rate_pct"] = st.number_input("Estimated property tax (% purchase)", 0.0, 10.0, 2.3, 0.1, key="scout_s8_tax_rate")
+            s85, s86, s87, s88 = st.columns(4)
+            with s85:
+                scout_finance["annual_insurance"] = money_input("Annual insurance ($)", 3000, key="scout_s8_insurance")
+            with s86:
+                scout_finance["payment_standard_pct"] = st.number_input("HUD reference rent multiplier (%)", 50.0, 150.0, 100.0, 1.0, key="scout_s8_paystd")
+            with s87:
+                scout_finance["utility_allowance"] = money_input("Utility allowance / tenant-paid utilities ($/mo)", 0, key="scout_s8_utility")
+            with s88:
+                scout_finance["closing_pct"] = st.number_input("Acquisition closing costs (%)", 0.0, 10.0, 2.0, 0.25, key="scout_s8_closing")
+            scout_finance.update({"term_years": 30, "vacancy_pct": 5.0, "management_pct": 8.0, "maintenance_pct": 5.0, "capex_pct": 5.0})
+            if not get_hud_token():
+                st.info("For automatic HUD FY2026 SAFMR/FMR reference rents, add a free HUD_API_TOKEN in Streamlit Secrets. You can still scan listings without it.")
+
+        scan_btn = st.button("Find deals in these areas", type="primary", use_container_width=True, key="run_area_scan")
+
+    if scan_btn:
+        zips = []
+        for token in re.split(r"[^0-9]+", scout_zips_raw or ""):
+            if len(token) == 5 and token not in zips:
+                zips.append(token)
+        if not zips:
+            st.error("Enter at least one valid 5-digit ZIP code.")
+        elif not key:
+            st.error("Add your RentCast API key first. Area Deal Scout uses one listing-search request per uncached ZIP.")
+        else:
+            frames = []
+            source_notes = []
+            hud_profiles = {}
+            hud_token = get_hud_token()
+            with st.spinner("Scanning active listings and ranking candidates..."):
+                for z in zips:
+                    try:
+                        recs, fetched_at, source = get_area_listings(
+                            z, key, scout_type, scout_beds.strip(), scout_max_price, scout_days, scout_limit
+                        )
+                        frame = area_listing_df(recs)
+                        if not frame.empty:
+                            frames.append(frame)
+                        source_notes.append(f"{z}: {len(recs)} listings · {source}")
+                        if scout_strategy == "Section 8" and hud_token:
+                            hud_profiles[z] = hud_houston_safmr(z, hud_token, 2026)
+                    except Exception as e:
+                        source_notes.append(f"{z}: error — {e}")
+            combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+            scored = score_area_candidates(combined, scout_strategy, hud_profiles, scout_finance)
+            st.session_state["area_scan_df"] = scored
+            st.session_state["area_scan_sources"] = source_notes
+            st.session_state["area_scan_strategy"] = scout_strategy
+            st.session_state["area_scan_hud_profiles"] = hud_profiles
+            st.session_state.pop("area_scan_hcad", None)
+
+    area_df = st.session_state.get("area_scan_hcad")
+    if area_df is None:
+        area_df = st.session_state.get("area_scan_df")
+
+    if isinstance(area_df, pd.DataFrame) and not area_df.empty:
+        strategy_used = st.session_state.get("area_scan_strategy", scout_strategy)
+        st.markdown(f"#### Best preliminary candidates · {strategy_used}")
+        st.caption(
+            "Screen Score is a triage score from asking $/sf, market time and—when Section 8 is selected—HUD reference-rent cash flow. "
+            "It is not an ARV, appraisal, or recommendation to buy. Deep-underwrite the property before making an offer."
+        )
+        notes = st.session_state.get("area_scan_sources") or []
+        if notes:
+            st.caption(" | ".join(notes))
+
+        show_cols = ["Screen Score", "Address", "ZIP", "Price", "Beds", "Baths", "Sq Ft", "$/Sq Ft", "DOM", "Property Type", "Why it surfaced"]
+        if strategy_used == "Section 8":
+            show_cols += ["HUD Ref Rent", "Est. S8 Cash Flow"]
+        if "HCAD Market Value" in area_df.columns:
+            show_cols += ["HCAD Market Value", "Ask / HCAD Market", "HCAD Owner"]
+        show_cols = [c for c in show_cols if c in area_df.columns]
+        fmt = {
+            "Price": "${:,.0f}", "$/Sq Ft": "${:,.0f}", "HUD Ref Rent": "${:,.0f}",
+            "Est. S8 Cash Flow": "${:,.0f}", "HCAD Market Value": "${:,.0f}", "Ask / HCAD Market": "{:.2f}x",
+        }
+        try:
+            st.dataframe(area_df[show_cols].head(50).style.format(fmt, na_rep="—"), use_container_width=True, hide_index=True)
+        except Exception:
+            st.dataframe(area_df[show_cols].head(50), use_container_width=True, hide_index=True)
+
+        # Area comparison summary for multi-ZIP scans.
+        if area_df["ZIP"].nunique() > 1:
+            st.markdown("##### Area comparison")
+            summaries = []
+            for z, g in area_df.groupby("ZIP"):
+                summaries.append({
+                    "ZIP": z,
+                    "Listings": len(g),
+                    "Median Ask": pd.to_numeric(g["Price"], errors="coerce").median(),
+                    "Median $/Sq Ft": pd.to_numeric(g["$/Sq Ft"], errors="coerce").median(),
+                    "Median DOM": pd.to_numeric(g["DOM"], errors="coerce").median(),
+                    "Median Screen Score": pd.to_numeric(g["Screen Score"], errors="coerce").median(),
+                    "Median HUD Ref Rent": pd.to_numeric(g.get("HUD Ref Rent"), errors="coerce").median() if "HUD Ref Rent" in g else None,
+                })
+            sdf = pd.DataFrame(summaries).sort_values("Median Screen Score", ascending=False)
+            st.dataframe(
+                sdf.style.format({"Median Ask":"${:,.0f}", "Median $/Sq Ft":"${:,.0f}", "Median HUD Ref Rent":"${:,.0f}"}, na_rep="—"),
+                use_container_width=True, hide_index=True,
+            )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Add HCAD parcel values to top 15 (free)", use_container_width=True, key="area_hcad_enrich"):
+                with st.spinner("Checking official Harris County parcel records..."):
+                    st.session_state["area_scan_hcad"] = enrich_area_hcad(st.session_state.get("area_scan_df"), 15)
+                st.rerun()
+        with c2:
+            st.caption("HCAD market/appraised values are county assessment data—not ARV and not a substitute for sales comps.")
+
+        options = [a for a in area_df["Address"].dropna().astype(str).tolist() if a]
+        if options:
+            selected_address = st.selectbox("Choose a candidate for full underwriting", options, key="area_selected_address")
+            chosen = area_df[area_df["Address"].astype(str) == selected_address].iloc[0]
+            if st.button("Open selected deal in full analyzer", type="primary", use_container_width=True, key="open_area_candidate"):
+                st.session_state["property_address"] = selected_address
+                if chosen.get("Price") not in (None, "") and pd.notna(chosen.get("Price")):
+                    st.session_state["setup_purchase"] = f"{float(chosen.get('Price')):,.0f}"
+                # Section 8 is analyzed in its dedicated tab after the standard 2-call Quick Scan.
+                st.session_state["setup_strategy"] = "Rental" if strategy_used == "Section 8" else strategy_used
+                st.session_state["workflow_mode"] = "Analyze Property"
+                st.rerun()
+    else:
+        st.info("Choose your ZIP(s) and click **Find deals in these areas**. The scanner will rank candidates before you spend deep-analysis calls on them.")
+
+    st.stop()
+
 # Strategy-specific widgets use stable keys, so Streamlit preserves values when you switch strategies.
-# Hidden strategies fall back to conservative defaults until you select and edit them.
+# The selected property's underwriting ARV is editable and stored per address so an override does not leak into a different deal.
+existing_analysis = st.session_state.get("analysis") or {}
+existing_valuation = existing_analysis.get("valuation") or {}
+existing_provider_arv = float(existing_valuation.get("price") or 0)
+existing_address_key = str(existing_analysis.get("address_key") or "").strip()
+
 st.markdown("### Deal setup")
-st.caption("Choose the strategy you are evaluating. DealFinder keeps the setup at the top and only shows the assumptions that matter most for that strategy. Dollar inputs use thousands separators.")
+st.caption("Choose the strategy you are evaluating. DealFinder keeps the setup at the top and only shows the assumptions that matter for that strategy. Dollar inputs use thousands separators.")
 with st.container(border=True):
-    top1, top2, top3 = st.columns([1.0, 1.25, 1.25])
+    top1, top2, top3, top4 = st.columns([0.9, 1.15, 1.05, 1.15])
     with top1:
         strategy = st.selectbox(
             "Strategy",
-            ["Flip", "Wholesale", "BRRRR", "Rental"],
+            ["Flip", "Wholesale", "BRRRR", "Rental", "Section 8"],
             key="setup_strategy",
         )
     with top2:
@@ -2077,6 +2704,24 @@ with st.container(border=True):
         )
     with top3:
         rehab = money_input("Rehab budget ($)", 40000, key="setup_rehab")
+    with top4:
+        if existing_provider_arv > 0 and existing_address_key:
+            arv_widget_key = f"setup_underwriting_arv_{existing_address_key}"
+            underwriting_arv_input = money_input(
+                "Underwriting ARV ($)",
+                existing_provider_arv,
+                key=arv_widget_key,
+                help="Editable. DealFinder uses this value for strategy math. The original RentCast estimate remains visible below for comparison.",
+            )
+            arv_delta = underwriting_arv_input - existing_provider_arv
+            if abs(arv_delta) >= 1:
+                pct = (arv_delta / existing_provider_arv * 100) if existing_provider_arv else 0
+                st.caption(f"RentCast: {money(existing_provider_arv)} · override {arv_delta:+,.0f} ({pct:+.1f}%)")
+            else:
+                st.caption(f"RentCast estimate: {money(existing_provider_arv)}")
+        else:
+            underwriting_arv_input = 0
+            st.text_input("Underwriting ARV ($)", value="Run a property first", disabled=True, key="setup_arv_waiting")
 
     core1, core2, core3 = st.columns(3)
     with core1:
@@ -2086,7 +2731,12 @@ with st.container(border=True):
             key="setup_closing",
         )
     with core2:
-        holding = money_input("Holding + pre-exit financing ($)", 12000, key="setup_holding")
+        holding = money_input(
+            "Holding + financing costs ($)",
+            12000,
+            key="setup_holding",
+            help="Carrying costs while you own the property before sale or refinance: financing/interest, taxes, insurance, utilities, HOA, lawn/security and similar costs.",
+        )
     with core3:
         contingency = st.number_input(
             "Rehab contingency (%)",
@@ -2099,7 +2749,12 @@ with st.container(border=True):
     if strategy == "Flip":
         s1, s2, s3 = st.columns(3)
         with s1:
-            selling = st.number_input("Selling costs (% of ARV)", 0.0, 20.0, state_number("setup_selling", 8.0), 0.5, key="setup_selling")
+            selling = st.number_input(
+                "Selling costs (% of sale price)", 0.0, 20.0,
+                state_number("setup_selling", 8.0), 0.5,
+                key="setup_selling",
+                help="Allowance for commissions, title/escrow, seller closing costs, concessions and other sale expenses.",
+            )
         with s2:
             target_profit = money_input("Target net profit ($)", 35000, key="setup_target_profit_money")
             st.session_state["setup_target_profit"] = target_profit
@@ -2109,7 +2764,7 @@ with st.container(border=True):
     elif strategy == "Wholesale":
         s1, s2, s3, s4 = st.columns(4)
         with s1:
-            selling = st.number_input("End-buyer selling costs (% ARV)", 0.0, 20.0, state_number("setup_selling", 8.0), 0.5, key="setup_selling")
+            selling = st.number_input("End-buyer selling costs (% of sale price)", 0.0, 20.0, state_number("setup_selling", 8.0), 0.5, key="setup_selling")
         with s2:
             target_profit = money_input("End-buyer target profit ($)", 35000, key="setup_target_profit_money")
             st.session_state["setup_target_profit"] = target_profit
@@ -2158,7 +2813,7 @@ with st.container(border=True):
             with o6:
                 capex_match = st.number_input("CapEx reserve (%)", 0.0, 30.0, state_number("setup_capex", 5.0), 1.0, key="setup_capex")
 
-    else:  # Rental
+    else:  # Rental or Section 8
         s1, s2, s3, s4 = st.columns(4)
         with s1:
             rental_down = st.number_input("Down payment (%)", 0.0, 100.0, state_number("setup_rental_down", 20.0), 1.0, key="setup_rental_down")
@@ -2169,14 +2824,30 @@ with st.container(border=True):
         with s4:
             cap = st.number_input("Target cap rate (%)", 0.1, 30.0, state_number("setup_cap", 6.0), 0.25, key="setup_cap")
 
-        s5, s6 = st.columns(2)
-        with s5:
-            rental_min_cf = money_input("Minimum monthly cash flow ($)", 250, key="setup_rental_min_cf_money")
-            st.session_state["setup_rental_min_cf"] = rental_min_cf
-        with s6:
+        if strategy == "Section 8":
+            s5, s6, s7, s8 = st.columns(4)
+            with s5:
+                s8_manual_rent_match = money_input(
+                    "Section 8 rent override ($/mo)", 0, key="setup_s8_manual_rent",
+                    help="Leave 0 to use the HUD FMR/SAFMR reference when your HUD token is connected; if unavailable, DealFinder falls back to the RentCast market-rent estimate for screening.",
+                )
+            with s6:
+                s8_multiplier_match = st.number_input("HUD reference multiplier (%)", 50.0, 150.0, state_number("setup_s8_multiplier", 100.0), 1.0, key="setup_s8_multiplier")
+            with s7:
+                s8_utility_match = money_input("Utility allowance ($/mo)", 0, key="setup_s8_utility")
+            with s8:
+                s8_min_cf_match = money_input("Target monthly cash flow ($)", 250, key="setup_s8_min_cf")
             min_dscr_global = st.number_input("Minimum DSCR", 0.0, 5.0, state_number("setup_min_dscr", 1.20), 0.05, key="setup_min_dscr")
+        else:
+            s5, s6 = st.columns(2)
+            with s5:
+                rental_min_cf = money_input("Minimum monthly cash flow ($)", 250, key="setup_rental_min_cf_money")
+                st.session_state["setup_rental_min_cf"] = rental_min_cf
+            with s6:
+                min_dscr_global = st.number_input("Minimum DSCR", 0.0, 5.0, state_number("setup_min_dscr", 1.20), 0.05, key="setup_min_dscr")
 
-        with st.expander("Rental operating assumptions", expanded=False):
+        expander_label = "Section 8 operating assumptions" if strategy == "Section 8" else "Rental operating assumptions"
+        with st.expander(expander_label, expanded=False):
             o1, o2, o3 = st.columns(3)
             with o1:
                 taxes_override_match = money_input("Annual property taxes override ($)", 0, key="setup_taxes_money", help="Leave 0 to use loaded property-tax data when available.")
@@ -2198,7 +2869,7 @@ with st.container(border=True):
                 opex = st.number_input("Legacy operating expense (%)", 0.0, 90.0, state_number("setup_opex", 35.0), 1.0, key="setup_opex")
 
 # Pull assumptions for strategies that are currently hidden. This lets Strategy Match
-# continue comparing all four strategies while keeping the screen uncluttered.
+# continue comparing all five strategies while keeping the screen uncluttered.
 selling = state_number("setup_selling", 8.0)
 target_profit = parse_money_input(st.session_state.get("setup_target_profit_money", st.session_state.get("setup_target_profit", 35000)), 35000)
 flip_min_roi = state_number("setup_flip_min_roi", 15.0)
@@ -2215,6 +2886,10 @@ rental_rate = state_number("setup_rental_rate", 7.5)
 rental_term = state_int("setup_rental_term", 30)
 rental_min_cf = parse_money_input(st.session_state.get("setup_rental_min_cf_money", st.session_state.get("setup_rental_min_cf", 250)), 250)
 cap = state_number("setup_cap", 6.0)
+s8_manual_rent_match = parse_money_input(st.session_state.get("setup_s8_manual_rent", 0), 0)
+s8_multiplier_match = state_number("setup_s8_multiplier", 100.0)
+s8_utility_match = parse_money_input(st.session_state.get("setup_s8_utility", 0), 0)
+s8_min_cf_match = parse_money_input(st.session_state.get("setup_s8_min_cf", 250), 250)
 vacancy = state_number("setup_vacancy", 5.0)
 management_match = state_number("setup_management", 8.0)
 maintenance_match = state_number("setup_maintenance", 5.0)
@@ -2224,7 +2899,7 @@ taxes_override_match = parse_money_input(st.session_state.get("setup_taxes_money
 opex = state_number("setup_opex", 35.0)
 
 with st.form("address_form"):
-    address = st.text_input("Property address", placeholder="1234 Example St, Houston, TX 77021")
+    address = st.text_input("Property address", placeholder="1234 Example St, Houston, TX 77021", key="property_address")
     submitted = st.form_submit_button("Run deal analysis", type="primary", use_container_width=True)
 
 if submitted:
@@ -2284,6 +2959,9 @@ if submitted:
                         "cache_source": "Quick Scan · ARV + rent only",
                     }
                     db_save_snapshot(address_key, address_clean, fresh_snapshot)
+                # Rerun once after a successful analysis so the per-property editable ARV
+                # appears immediately in Deal setup with the provider estimate prefilled.
+                st.rerun()
             except Exception as e:
                 st.error(str(e))
 
@@ -2295,8 +2973,36 @@ if not A:
 val, rent_data, market = A["valuation"], A["rent"], A["market"]
 property_record = A.get("property_record") or {}
 listing_record = A.get("listing_record") or {}
-subj = val.get("subjectProperty") or {}; arv = val.get("price") or 0; rent_m = rent_data.get("rent") or 0
-ceiling, label, note = offer_math(strategy, arv, rent_m, rehab, closing, selling, holding, contingency, target_profit, assignment, refi_ltv, vacancy, opex, cap)
+subj = val.get("subjectProperty") or {}
+provider_arv = float(val.get("price") or 0)
+rent_m = float(rent_data.get("rent") or 0)
+zip_code = str(subj.get("zipCode") or market.get("zipCode") or property_record.get("zipCode") or "—")
+
+# Per-property editable underwriting ARV. The provider estimate is preserved separately.
+arv_widget_key = f"setup_underwriting_arv_{A.get('address_key','')}"
+arv = parse_money_input(st.session_state.get(arv_widget_key, provider_arv), provider_arv)
+if arv <= 0:
+    arv = provider_arv
+
+# Section 8 reference rent can come from a manual override, HUD FMR/SAFMR, or market-rent fallback.
+subject_beds_match = subj.get("bedrooms") or property_record.get("bedrooms") or 2
+hud_token_match = get_hud_token()
+hud_profile_match = hud_houston_safmr(zip_code, hud_token_match, 2026) if hud_token_match and zip_code != "—" else {}
+hud_ref_match = hud_reference_rent(hud_profile_match, subject_beds_match)
+s8_base_rent_match = float(s8_manual_rent_match or hud_ref_match or rent_m or 0)
+s8_underwriting_rent_match = max(
+    s8_base_rent_match * float(s8_multiplier_match or 100) / 100 - float(s8_utility_match or 0),
+    0,
+)
+s8_rent_source_match = (
+    "Manual Section 8 rent" if s8_manual_rent_match
+    else "HUD FY2026 reference rent" if hud_ref_match
+    else "RentCast market-rent fallback"
+)
+
+offer_strategy = "Rental" if strategy == "Section 8" else strategy
+offer_rent = s8_underwriting_rent_match if strategy == "Section 8" else rent_m
+ceiling, label, note = offer_math(offer_strategy, arv, offer_rent, rehab, closing, selling, holding, contingency, target_profit, assignment, refi_ltv, vacancy, opex, cap)
 
 st.subheader(subj.get("formattedAddress") or A["input"])
 bits=[subj.get("propertyType"), f'{subj.get("bedrooms")} bd' if subj.get("bedrooms") is not None else None, f'{subj.get("bathrooms")} ba' if subj.get("bathrooms") is not None else None, f'{subj.get("squareFootage"):,} sf' if isinstance(subj.get("squareFootage"),(int,float)) else None, f'Built {subj.get("yearBuilt")}' if subj.get("yearBuilt") else None]
@@ -2310,21 +3016,25 @@ area_bits = [
 ]
 st.caption("Area: " + " · ".join([str(x) for x in area_bits if x]))
 
-m1,m2,m3,m4=st.columns(4)
-with m1: result_card("Estimated ARV", money(arv))
-with m2: result_card("ARV range", f'{money(val.get("priceRangeLow"))} – {money(val.get("priceRangeHigh"))}')
-with m3: result_card("Estimated rent", f'{money(rent_m)}/mo')
-with m4: result_card(label, money(ceiling))
+m1,m2,m3,m4,m5=st.columns(5)
+arv_delta = arv - provider_arv
+arv_sub = "Custom underwriting ARV" if abs(arv_delta) >= 1 else "Using RentCast estimate"
+with m1: result_card("Underwriting ARV", money(arv), arv_sub)
+with m2: result_card("RentCast ARV", money(provider_arv), f'{arv_delta:+,.0f} difference' if abs(arv_delta) >= 1 else "Provider estimate")
+with m3: result_card("ARV range", f'{money(val.get("priceRangeLow"))} – {money(val.get("priceRangeHigh"))}')
+with m4: result_card("Estimated rent", f'{money(rent_m)}/mo')
+with m5: result_card(label, money(ceiling))
 st.caption(note)
+if strategy == "Section 8":
+    st.caption(f"Section 8 screening rent: {money(s8_underwriting_rent_match)}/mo · source: {s8_rent_source_match}. Verify the local PHA payment standard, utility allowance and rent reasonableness before relying on it.")
 st.info(f'Quick Scan snapshot: {A.get("quick_fetched_at") or A["time"]} · source: {A.get("cache_source","cache")}. New addresses use ARV + rent only (2 RentCast endpoints); fresh NORVIM-cached addresses use 0.')
 st.warning("Underwriting estimate only. Verify title, condition, flood risk, taxes, liens, repair scope and local comps before contracting.")
 
-tabs=st.tabs(["DealFinder","Property record","Listing","Deal","BRRRR","Sales comps","Neighborhood map","Area market","Rental","Export","Strategy Match","Offer Lab","Neighborhood Intel","CRM"])
+tabs=st.tabs(["DealFinder","Property record","Listing","Deal","BRRRR","Sales comps","Neighborhood map","Area market","Rental","Section 8","Export","Strategy Match","Offer Lab","Neighborhood Intel","CRM"])
 
 # Precompute reusable tables from Quick Scan. ZIP market data is optional and loaded separately.
 cdf_all=comp_df(val.get("comparables") or [])
 rdf=rental_comp_df(rent_data.get("comparables") or [])
-zip_code=str(subj.get("zipCode") or market.get("zipCode") or "—")
 
 # Reuse one permanent ZIP-market snapshot across every property in that ZIP.
 market_fresh = bool(market) and snapshot_field_fresh(A, "market_fetched_at", 30, value_key="market", fallback_to_time=True)
@@ -2384,6 +3094,7 @@ strategy_results = strategy_match(
     vacancy, management_match, maintenance_match, capex_match,
     brrrr_min_cf, brrrr_max_cash_left, min_dscr_global,
     rental_down, rental_rate, rental_term, rental_min_cf, cap,
+    s8_underwriting_rent_match, s8_min_cf_match, cap,
 )
 preferred_result = strategy_row_by_name(strategy_results, strategy)
 best_result = strategy_results[0] if strategy_results else None
@@ -2427,7 +3138,7 @@ with tabs[0]:
     with d3: result_card("Strongest modeled fit", best_result.get("strategy") if best_result else "—", best_result.get("status") if best_result else "—")
     with d4: result_card("Same-ZIP comps", len(cdf_same_zip), f"ZIP {zip_code}")
 
-    st.caption("DealFinder compares Flip, Wholesale, BRRRR and Rental every time. Quick Scan uses ARV + rent only; optional records are loaded only when you request them. A result means the strategy meets or misses your configured thresholds; it is not a guarantee to buy or avoid the property.")
+    st.caption("DealFinder compares Flip, Wholesale, BRRRR, Rental and Section 8 every time. Quick Scan uses ARV + rent only; optional records are loaded only when you request them. A result means the strategy meets or misses your configured thresholds; it is not a guarantee to buy or avoid the property.")
     if effective_tax_match <= 0:
         st.warning("Quick Scan currently has no annual property-tax amount. BRRRR/Rental cash flow may look stronger than reality. Enter a tax override in the Deal setup above or load the Property record.")
     st.markdown("#### Property & neighborhood snapshot")
@@ -2468,6 +3179,9 @@ with tabs[0]:
 
 with tabs[1]:
     st.markdown("#### Public-record property profile")
+    resolved_deep_address = resolved_property_address(A)
+    if resolved_deep_address and normalize_address(resolved_deep_address) != normalize_address(A.get("input", "")):
+        st.caption(f"Resolved address for deep-data lookups: {resolved_deep_address}")
     property_profile_fresh = bool(property_record) and snapshot_field_fresh(
         A, "property_record_fetched_at", 180, value_key="property_record", fallback_to_time=True
     )
@@ -2476,7 +3190,7 @@ with tabs[1]:
         if st.button("Refresh property record (up to 1 RentCast call)", key="refresh_property_record"):
             with st.spinner("Loading property record..."):
                 try:
-                    rec, rec_time = property_record_cached(A["address_key"], key, A["input"])
+                    rec, rec_time = property_record_cached(A["address_key"], key, resolved_property_address(A))
                     A["property_record"] = rec or {}
                     A["property_record_fetched_at"] = rec_time
                     A["time"] = utc_now_iso()
@@ -2493,7 +3207,7 @@ with tabs[1]:
         if st.button("Load full property record (up to 1 RentCast call)", type="primary", key="load_property_record"):
             with st.spinner("Loading property record..."):
                 try:
-                    rec, rec_time = property_record_cached(A["address_key"], key, A["input"])
+                    rec, rec_time = property_record_cached(A["address_key"], key, resolved_property_address(A))
                     A["property_record"] = rec or {}
                     A["property_record_fetched_at"] = rec_time
                     A["time"] = utc_now_iso()
@@ -2699,7 +3413,7 @@ with tabs[2]:
 
 with tabs[3]:
     st.markdown("#### Deal math")
-    rows=[["ARV",arv],["Rehab",rehab],["Acquisition closing @ offer ceiling",ceiling*closing/100],["Selling-cost allowance",arv*selling/100],["Holding + financing",holding],["Rehab contingency",rehab*contingency/100],["Target profit",target_profit if strategy in ("Flip","Wholesale") else None],["Assignment fee",assignment if strategy=="Wholesale" else None],["Offer ceiling",ceiling]]
+    rows=[["Underwriting ARV",arv],["RentCast ARV",provider_arv if abs(arv-provider_arv)>=1 else None],["Rehab",rehab],["Acquisition closing costs @ offer ceiling",ceiling*closing/100],["Estimated selling costs",arv*selling/100 if strategy in ("Flip","Wholesale") else None],["Holding + financing costs",holding],["Rehab contingency",rehab*contingency/100],["Target profit",target_profit if strategy in ("Flip","Wholesale") else None],["Assignment fee",assignment if strategy=="Wholesale" else None],["Offer ceiling",ceiling]]
     df=pd.DataFrame(rows,columns=["Item","Amount"]).dropna()
     st.dataframe(df.style.format({"Amount":"${:,.0f}"}),use_container_width=True,hide_index=True)
 
@@ -3088,7 +3802,7 @@ with tabs[6]:
                         ntime = saved.get("time") or utc_now_iso()
                     else:
                         nsales, nactive, ntime = neighborhood_cached(
-                            n_key, key, A["input"], subj.get("propertyType")
+                            n_key, key, resolved_property_address(A), subj.get("propertyType")
                         )
                         db_save_snapshot(neighborhood_db_key, A["input"], {
                             "recent_sales": nsales,
@@ -3299,6 +4013,62 @@ with tabs[8]:
         st.dataframe(rdf[rcols].style.format({"Rent":"${:,.0f}","Rent/Sq Ft":"${:,.2f}","Distance (mi)":"{:.2f}","Similarity":"{:.0%}"},na_rep="—"),use_container_width=True,hide_index=True)
 
 with tabs[9]:
+    st.markdown("#### Section 8 / Housing Choice Voucher underwriting")
+    st.caption("Uses HUD FY2026 Fair Market Rent / Small Area FMR as a reference point. Actual PHA payment standards, utility allowances, rent reasonableness and approved contract rent can differ.")
+    hud_token = get_hud_token()
+    hud_profile = hud_houston_safmr(zip_code, hud_token, 2026) if hud_token and zip_code != "—" else {}
+    subject_beds = subj.get("bedrooms") or property_record.get("bedrooms") or 2
+    hud_ref = hud_reference_rent(hud_profile, subject_beds)
+
+    if not hud_token:
+        st.info('Add a free HUD API token in Streamlit Secrets as `HUD_API_TOKEN = "..."` to load FY2026 HUD reference rents automatically.')
+    elif hud_profile.get("_error"):
+        st.warning(f"HUD data could not be loaded: {hud_profile.get('_error')}")
+
+    s1,s2,s3,s4=st.columns(4)
+    with s1: result_card("HUD reference rent", money(hud_ref) + "/mo" if hud_ref else "—", hud_profile.get("source_scope") if hud_profile else "HUD token needed")
+    with s2: result_card("RentCast market rent", money(rent_m) + "/mo")
+    with s3: result_card("Bedrooms used", f"{float(subject_beds):.0f}" if subject_beds not in (None,"") else "—")
+    with s4: result_card("HUD data year", hud_profile.get("year") or "—")
+
+    with st.container(border=True):
+        p1,p2,p3,p4=st.columns(4)
+        with p1:
+            s8_multiplier = st.number_input("HUD reference rent multiplier (%)", 50.0, 150.0, 100.0, 1.0, key="s8_payment_standard_pct", help="Use this only as an underwriting assumption. Your local PHA's actual payment standard may differ.")
+        with p2:
+            s8_utility = money_input("Utility allowance / tenant-paid utilities ($/mo)", 0, key="s8_utility_allowance")
+        with p3:
+            s8_manual = money_input("Manual approved/reference rent override ($/mo)", 0, key="s8_manual_rent", help="If you already know the applicable payment standard or expected approved rent, enter it here.")
+        with p4:
+            s8_min_cf = money_input("Target monthly cash flow ($)", 250, key="s8_target_cf")
+
+    base_s8_rent = float(s8_manual or hud_ref or 0)
+    modeled_s8_rent = max(base_s8_rent * float(s8_multiplier or 100) / 100 - float(s8_utility or 0), 0)
+    s8_model = rental_buy_hold_model(
+        purchase_scenario, modeled_s8_rent, rehab, closing, rental_down, rental_rate, rental_term,
+        effective_tax_match, insurance_match, hoa_match,
+        vacancy, management_match, maintenance_match, capex_match, 0
+    )
+    z1,z2,z3,z4=st.columns(4)
+    with z1: result_card("Underwriting rent", money(modeled_s8_rent) + "/mo", "After your multiplier / utility assumption")
+    with z2: result_card("Estimated cash flow", money(s8_model.get("cash_flow")) + "/mo", "Meets target" if s8_model.get("cash_flow",0) >= s8_min_cf else "Below target")
+    with z3: result_card("Cash needed", money(s8_model.get("cash_in")), f"{rental_down:.0f}% down + closing + rehab")
+    with z4: result_card("DSCR", f'{s8_model.get("dscr"):.2f}x' if s8_model.get("dscr") is not None else "—")
+    z5,z6,z7,z8=st.columns(4)
+    with z5: result_card("Cap rate", f'{s8_model.get("cap_rate")*100:.2f}%' if s8_model.get("cap_rate") is not None else "—")
+    with z6: result_card("Cash-on-cash", f'{s8_model.get("cash_on_cash")*100:.2f}%' if s8_model.get("cash_on_cash") is not None else "—")
+    with z7: result_card("Mortgage P&I", money(s8_model.get("payment")) + "/mo")
+    with z8: result_card("Annual cash flow", money(s8_model.get("annual_cash_flow")))
+
+    if not effective_tax_match:
+        st.warning("Property taxes are currently $0 in this model because a tax record/override has not been loaded. Load the Property record or enter a tax override before relying on Section 8 cash flow.")
+    if hud_ref and rent_m:
+        diff = hud_ref - float(rent_m or 0)
+        st.info(f"HUD reference is {money(abs(diff))}/mo {'above' if diff >= 0 else 'below'} the RentCast market-rent estimate for this bedroom count/ZIP reference.")
+    st.caption("HUD FMR/SAFMR is a reference dataset, not a promise of voucher rent. Verify the administering PHA, current payment standard, utility allowance, inspection requirements and rent-reasonableness approval for the actual unit.")
+
+
+with tabs[10]:
     row={
         "analyzed_at_utc":A["time"],"address":subj.get("formattedAddress") or A["input"],"strategy":strategy,
         "property_type":subj.get("propertyType"),"beds":subj.get("bedrooms"),"baths":subj.get("bathrooms"),
@@ -3346,13 +4116,13 @@ with tabs[9]:
     st.caption("Deal summary export. Strategy Match, CRM and public-data intelligence are available in their dedicated tabs.")
 
 
-with tabs[10]:
+with tabs[11]:
     st.markdown("#### Strategy Match")
-    st.caption("All four strategies are evaluated at the same purchase price. Change the price in the sidebar or use Offer Lab to test negotiations.")
+    st.caption("Flip, Wholesale, BRRRR, Rental and Section 8 are evaluated at the same purchase price. Change the price in Deal setup or use Offer Lab to test negotiations.")
 
     st.markdown(f"**Purchase scenario:** {money(purchase_scenario)}")
-    cols = st.columns(4)
-    for col, row in zip(cols, [strategy_row_by_name(strategy_results, n) for n in ["Flip","Wholesale","BRRRR","Rental"]]):
+    cols = st.columns(5)
+    for col, row in zip(cols, [strategy_row_by_name(strategy_results, n) for n in ["Flip","Wholesale","BRRRR","Rental","Section 8"]]):
         with col:
             render_strategy_card(row)
 
@@ -3371,7 +4141,7 @@ with tabs[10]:
     rows = []
     for r in strategy_results:
         secondary = r.get("secondary")
-        if r["strategy"] in ("BRRRR","Rental"):
+        if r["strategy"] in ("BRRRR","Rental","Section 8"):
             secondary_text = strategy_explanation(r)
         elif r["strategy"] == "Flip":
             secondary_text = f'{r["details"].get("roi")*100:.1f}% ROI' if r["details"].get("roi") is not None else "—"
@@ -3393,11 +4163,11 @@ with tabs[10]:
     st.write(
         "Flip checks target net profit and ROI. Wholesale checks whether there is enough room below the modeled end-buyer flip ceiling. "
         "BRRRR checks monthly cash flow, cash left after refinance, rent cushion (DSCR), and equity creation. "
-        "Rental checks monthly cash flow, rent cushion, and cap rate."
+        "Rental checks monthly cash flow, rent cushion, and cap rate. Section 8 uses the HUD/manual underwriting rent and the same rental cash-flow, DSCR and cap-rate checks."
     )
 
 
-with tabs[11]:
+with tabs[12]:
     st.markdown("#### Offer Lab")
     st.caption("This section recalculates locally. Moving the slider does **not** make another RentCast request.")
 
@@ -3420,17 +4190,20 @@ with tabs[11]:
         vacancy, management_match, maintenance_match, capex_match,
         brrrr_min_cf, brrrr_max_cash_left, min_dscr_global,
         rental_down, rental_rate, rental_term, rental_min_cf, cap,
+        s8_underwriting_rent_match, s8_min_cf_match, cap,
     )
     lab_best = lab[0] if lab else None
-    o1,o2,o3,o4=st.columns(4)
+    o1,o2,o3,o4,o5=st.columns(5)
     flip_lab = strategy_row_by_name(lab,"Flip")
     brrrr_lab = strategy_row_by_name(lab,"BRRRR")
     rental_lab = strategy_row_by_name(lab,"Rental")
+    section8_lab = strategy_row_by_name(lab,"Section 8")
     wholesale_lab = strategy_row_by_name(lab,"Wholesale")
     with o1: result_card("Flip profit", money((flip_lab or {}).get("details",{}).get("profit")), (flip_lab or {}).get("status"))
     with o2: result_card("Wholesale spread", money((wholesale_lab or {}).get("details",{}).get("spread")), (wholesale_lab or {}).get("status"))
     with o3: result_card("BRRRR cash flow", money((brrrr_lab or {}).get("details",{}).get("monthly_cash_flow")) + "/mo", (brrrr_lab or {}).get("status"))
     with o4: result_card("Rental cash flow", money((rental_lab or {}).get("details",{}).get("cash_flow")) + "/mo", (rental_lab or {}).get("status"))
+    with o5: result_card("Section 8 cash flow", money((section8_lab or {}).get("details",{}).get("cash_flow")) + "/mo", (section8_lab or {}).get("status"))
 
     if lab_best:
         st.info(f"At **{money(test_price)}**, the strongest modeled fit is **{lab_best['strategy']}** ({lab_best['status']}).")
@@ -3449,11 +4222,13 @@ with tabs[11]:
             vacancy, management_match, maintenance_match, capex_match,
             brrrr_min_cf, brrrr_max_cash_left, min_dscr_global,
             rental_down, rental_rate, rental_term, rental_min_cf, cap,
+            s8_underwriting_rent_match, s8_min_cf_match, cap,
         )
         f = strategy_row_by_name(rr,"Flip")
         w = strategy_row_by_name(rr,"Wholesale")
         b = strategy_row_by_name(rr,"BRRRR")
         r = strategy_row_by_name(rr,"Rental")
+        s8 = strategy_row_by_name(rr,"Section 8")
         ladder.append({
             "Purchase": p,
             "Flip Profit": (f or {}).get("details",{}).get("profit"),
@@ -3462,6 +4237,7 @@ with tabs[11]:
             "BRRRR Cash Flow": (b or {}).get("details",{}).get("monthly_cash_flow"),
             "BRRRR Cash Left": (b or {}).get("details",{}).get("cash_left"),
             "Rental Cash Flow": (r or {}).get("details",{}).get("cash_flow"),
+            "Section 8 Cash Flow": (s8 or {}).get("details",{}).get("cash_flow"),
             "Best Fit": rr[0]["strategy"] if rr else None,
         })
     ldf = pd.DataFrame(ladder)
@@ -3473,13 +4249,14 @@ with tabs[11]:
             "BRRRR Cash Flow":"${:,.0f}",
             "BRRRR Cash Left":"${:,.0f}",
             "Rental Cash Flow":"${:,.0f}",
+            "Section 8 Cash Flow":"${:,.0f}",
         }, na_rep="—"),
         use_container_width=True,
         hide_index=True,
     )
 
 
-with tabs[12]:
+with tabs[13]:
     st.markdown("#### Neighborhood Intelligence")
     st.caption("These sources are separate from RentCast. Loading them does not consume RentCast requests.")
 
@@ -3526,6 +4303,35 @@ with tabs[12]:
         if not plat_apps.empty:
             st.dataframe(plat_apps.head(30), use_container_width=True, hide_index=True)
 
+        hcad = pintel.get("hcad") or {}
+        st.markdown("##### Harris County parcel record")
+        if hcad:
+            h1,h2,h3,h4=st.columns(4)
+            with h1: result_card("HCAD owner", hcad.get("owner_name_1") or "—")
+            with h2: result_card("HCAD market value", money(hcad.get("total_market_val")))
+            with h3: result_card("HCAD appraised value", money(hcad.get("total_appraised_val")))
+            with h4: result_card("Land area", f'{float(hcad.get("land_sqft")):,.0f} sf' if hcad.get("land_sqft") not in (None,"") else "—")
+            h5,h6,h7,h8=st.columns(4)
+            with h5: result_card("Tax value", money(hcad.get("tax_value")))
+            with h6: result_card("Account", hcad.get("acct_num") or "—")
+            with h7: result_card("Ownership change", hcad.get("new_owner_date_iso") or "—")
+            with h8: result_card("Neighborhood code", hcad.get("nh_cd") or "—")
+            owner_mail = " ".join([str(x) for x in [hcad.get("mail_addr_1"), hcad.get("mail_addr_2"), hcad.get("mail_city"), hcad.get("mail_state"), hcad.get("mail_zip")] if x])
+            if owner_mail:
+                st.caption(f"HCAD mailing address: {owner_mail}")
+            st.caption("HCAD values are appraisal-district records. They are not an ARV or guaranteed market value.")
+        else:
+            st.caption("No HCAD parcel was returned at this coordinate. This can happen outside Harris County or during a temporary GIS outage.")
+
+        schools = pintel.get("schools") or []
+        st.markdown("##### Nearby public schools — NCES locations")
+        if schools:
+            sdf = pd.DataFrame(schools)
+            st.dataframe(sdf.head(12).style.format({"Distance (mi)":"{:.2f}"}, na_rep="—"), use_container_width=True, hide_index=True)
+            st.caption("School locations are provided as objective proximity context only. NORVIM does not infer school quality from these records.")
+        else:
+            st.caption("No nearby NCES school locations were returned, or the public service was temporarily unavailable.")
+
         census = pintel.get("census") or {}
         st.markdown(f"##### ZIP {zip_code} housing & economic context")
         if census:
@@ -3553,7 +4359,7 @@ with tabs[12]:
     with r5: st.link_button("FEMA flood maps", "https://msc.fema.gov/portal/home", use_container_width=True)
 
 
-with tabs[13]:
+with tabs[14]:
     st.markdown("#### NORVIM CRM / acquisition pipeline")
     if not db_enabled():
         st.warning("Connect Supabase to make the CRM permanent. Until then, analyses can still be exported but CRM changes will not survive redeploys.")
@@ -3627,4 +4433,4 @@ with tabs[13]:
             st.caption("No saved pipeline records yet.")
 
 
-st.caption("NORVIM DealFinder 2.2 · 2-call Quick Scan, optional deep data, permanent caching, strategy matching, offer sensitivity, neighborhood intelligence and CRM.")
+st.caption("NORVIM DealFinder 2.4 · 2-call Quick Scan, optional deep data, permanent caching, strategy matching, offer sensitivity, neighborhood intelligence and CRM.")
