@@ -1,7 +1,7 @@
 import os
 import re
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import quote, quote_plus
 import pandas as pd
 import requests
@@ -15,7 +15,7 @@ HCAD_PARCEL_URL = "https://www.gis.hctx.net/arcgis/rest/services/HCAD/Parcels/Ma
 NCES_SCHOOLS_URL = "https://nces.ed.gov/opengis/rest/services/K12_School_Locations/EDGE_GEOCODE_PUBLICSCH_2425/MapServer/0/query"
 HUD_FMR_API_BASE = "https://www.huduser.gov/hudapi/public/fmr"
 
-st.set_page_config(page_title="NORVIM DealFinder 2.5.4", page_icon="🏠", layout="wide")
+st.set_page_config(page_title="NORVIM DealFinder 2.7", page_icon="🏠", layout="wide")
 st.markdown("""
 <style>
 :root { color-scheme: light !important; }
@@ -557,7 +557,7 @@ def db_monthly_api_usage():
 
 def safe_public_get(url, params=None, timeout=18):
     try:
-        r = requests.get(url, params=params or {}, timeout=timeout, headers={"User-Agent": "NORVIM-DealFinder/2.5.3"})
+        r = requests.get(url, params=params or {}, timeout=timeout, headers={"User-Agent": "NORVIM-DealFinder/2.7"})
         if not r.ok:
             return {"_error": f"HTTP {r.status_code}"}
         data = r.json()
@@ -1551,6 +1551,87 @@ def hcad_offmarket_candidates(zip_codes=None, min_years_owned=15, max_market_val
         df = df.sort_values(["Lead Score", "Years Owned"], ascending=[False, False]).reset_index(drop=True)
     return df, None
 
+
+@st.cache_data(ttl=7 * 24 * 60 * 60, show_spinner=False)
+def hcad_owner_portfolio(owner_query, max_rows=500):
+    """Search official HCAD parcel records by owner-name tokens.
+
+    This is a public-record portfolio screen, not identity verification. Similar names,
+    trusts, spouses, aliases, entity spellings, and recently transferred parcels can
+    make the result incomplete or include unrelated owners.
+    """
+    raw = re.sub(r"\s+", " ", str(owner_query or "").strip()).upper()
+    tokens = [t for t in re.findall(r"[A-Z0-9&.-]+", raw) if len(t) >= 2]
+    if not tokens:
+        return pd.DataFrame(), "Enter at least part of an owner name."
+    # Require every typed token to appear in either HCAD owner-name field. This works
+    # even when the assessor stores names as LAST FIRST instead of FIRST LAST.
+    token_clauses = []
+    for token in tokens[:6]:
+        safe = token.replace("'", "''")
+        token_clauses.append(f"(owner_name_1 LIKE '%{safe}%' OR owner_name_2 LIKE '%{safe}%')")
+    where = " AND ".join(token_clauses)
+    payload = safe_public_get(
+        HCAD_PARCEL_URL,
+        {
+            "where": where,
+            "outFields": (
+                "acct_num,tax_year,owner_name_1,owner_name_2,mail_addr_1,mail_addr_2,mail_city,mail_state,mail_zip,"
+                "site_str_pfx,site_str_num,site_str_name,site_str_sfx,site_str_sfx_dir,site_city,site_zip,"
+                "land_value,bld_value,total_appraised_val,total_market_val,tax_value,new_owner_date,"
+                "legal_dscr_1,legal_dscr_2,acreage_1,land_sqft,state_class,land_use"
+            ),
+            "returnGeometry": "true",
+            "outSR": 4326,
+            "orderByFields": "owner_name_1,site_zip,site_str_name",
+            "resultRecordCount": min(max(int(max_rows), 25), 1000),
+            "f": "json",
+        },
+        timeout=30,
+    )
+    if not isinstance(payload, dict) or payload.get("_error"):
+        return pd.DataFrame(), (payload.get("_error") if isinstance(payload, dict) else "HCAD owner search failed")
+    today = datetime.now(timezone.utc).date()
+    rows = []
+    for feat in payload.get("features") or []:
+        a = feat.get("attributes") or {}
+        owner_iso = _date_from_epoch_ms(a.get("new_owner_date"))
+        years = None
+        if owner_iso:
+            try:
+                d = datetime.fromisoformat(owner_iso).date()
+                years = (today - d).days / 365.25
+            except Exception:
+                pass
+        lat, lon = _ring_center(feat.get("geometry") or {})
+        rows.append({
+            "Address": _hcad_site_address(a),
+            "ZIP": str(a.get("site_zip") or "")[:5],
+            "Owner 1": a.get("owner_name_1"),
+            "Owner 2": a.get("owner_name_2"),
+            "Owned Since": owner_iso,
+            "Years Owned": round(years, 1) if years is not None else None,
+            "Occupancy Proxy": _hcad_occupancy_proxy(a),
+            "Mailing Address": _hcad_mail_address(a),
+            "HCAD Market Value": a.get("total_market_val"),
+            "HCAD Appraised": a.get("total_appraised_val"),
+            "Tax Value": a.get("tax_value"),
+            "Land Value": a.get("land_value"),
+            "Building Value": a.get("bld_value"),
+            "Land Sq Ft": a.get("land_sqft"),
+            "Acreage": a.get("acreage_1"),
+            "Land Use": a.get("land_use"),
+            "State Class": a.get("state_class"),
+            "Legal Description": " ".join(str(x) for x in [a.get("legal_dscr_1"), a.get("legal_dscr_2")] if x),
+            "Account": a.get("acct_num"),
+            "Latitude": lat,
+            "Longitude": lon,
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.drop_duplicates(subset=["Account"], keep="first").reset_index(drop=True)
+    return df, None
+
 def score_area_candidates(df, strategy, hud_profiles=None, finance=None):
     """Preliminary area-screen score. It is intentionally not an ARV or appraisal.
 
@@ -1646,6 +1727,217 @@ def score_area_candidates(df, strategy, hud_profiles=None, finance=None):
         out["Est. S8 Cash Flow"] = s8_cf
     return out.sort_values(["Screen Score", "DOM"], ascending=[False, False], na_position="last").reset_index(drop=True)
 
+
+
+
+def _arcgis_date_to_datetime(value):
+    """Normalize ArcGIS epoch-millisecond or ISO date values to UTC datetime."""
+    if value in (None, ""):
+        return None
+    try:
+        if isinstance(value, (int, float)) or str(value).strip().replace(".", "", 1).isdigit():
+            return datetime.fromtimestamp(float(value) / 1000.0, tz=timezone.utc)
+    except Exception:
+        pass
+    try:
+        raw = str(value).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _parse_zip_tokens(raw):
+    vals = []
+    for token in re.split(r"[,;\s]+", str(raw or "")):
+        z = re.sub(r"\D", "", token)[:5]
+        if len(z) == 5 and z not in vals:
+            vals.append(z)
+    return vals[:20]
+
+
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def hcad_recent_transfer_activity(zip_codes=None, lookback_days=180, max_rows_per_scope=1000):
+    """Recent HCAD ownership-change records used as a transaction-activity proxy.
+
+    HCAD's new_owner_date indicates an ownership change, not necessarily an arms-length sale.
+    Houston-wide scans are capped samples; ZIP-specific scans are less likely to truncate.
+    """
+    zips = [re.sub(r"\D", "", str(z))[:5] for z in (zip_codes or [])]
+    zips = [z for z in zips if len(z) == 5]
+    scopes = zips if zips else [None]
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(int(lookback_days), 1))
+    rows = []
+    truncated = False
+    errors = []
+    for z in scopes:
+        where_parts = ["new_owner_date IS NOT NULL"]
+        if z:
+            where_parts.append(f"site_zip LIKE '{z}%'")
+        else:
+            where_parts.append("(site_city = 'HOUSTON' OR site_city = 'Houston')")
+        payload = safe_public_get(
+            HCAD_PARCEL_URL,
+            {
+                "where": " AND ".join(where_parts),
+                "outFields": (
+                    "acct_num,owner_name_1,site_str_pfx,site_str_num,site_str_name,site_str_sfx,site_str_sfx_dir,"
+                    "site_city,site_zip,total_market_val,total_appraised_val,new_owner_date,land_sqft,land_use"
+                ),
+                "returnGeometry": "true",
+                "outSR": 4326,
+                "orderByFields": "new_owner_date DESC",
+                "resultRecordCount": min(max(int(max_rows_per_scope), 100), 1000),
+                "f": "json",
+            },
+            timeout=30,
+        )
+        if not isinstance(payload, dict) or payload.get("_error"):
+            errors.append(f"{z or 'Houston'}: {(payload or {}).get('_error', 'HCAD request failed') if isinstance(payload, dict) else 'HCAD request failed'}")
+            continue
+        feats = payload.get("features") or []
+        if len(feats) >= min(max(int(max_rows_per_scope), 100), 1000):
+            truncated = True
+        for feat in feats:
+            a = feat.get("attributes") or {}
+            dt = _arcgis_date_to_datetime(a.get("new_owner_date"))
+            if not dt or dt < cutoff:
+                # Ordered newest to oldest, so records beyond this point are outside lookback.
+                continue
+            lat, lon = _ring_center(feat.get("geometry") or {})
+            rows.append({
+                "Address": _hcad_site_address(a),
+                "ZIP": str(a.get("site_zip") or "")[:5],
+                "Owner": a.get("owner_name_1"),
+                "Ownership Change": dt.date().isoformat(),
+                "Days Ago": (datetime.now(timezone.utc) - dt).days,
+                "HCAD Market Value": a.get("total_market_val"),
+                "HCAD Appraised": a.get("total_appraised_val"),
+                "Land Sq Ft": a.get("land_sqft"),
+                "Land Use": a.get("land_use"),
+                "Account": a.get("acct_num"),
+                "Latitude": lat,
+                "Longitude": lon,
+            })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        if "Account" in df.columns:
+            df = df.drop_duplicates(subset=["Account"], keep="first")
+        df = df.sort_values("Days Ago", ascending=True).reset_index(drop=True)
+    return df, {"truncated": truncated, "errors": errors, "scope": "ZIP-specific" if zips else "Houston-wide capped sample"}
+
+
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def houston_plat_activity(lookback_days=180, max_rows=1000, final_plats=False):
+    """Recent City of Houston PlatTracker activity with map centroids."""
+    layer = 0 if final_plats else 1
+    url = f"https://mycity2.houstontx.gov/geoplat01/rest/services/PlatTracker/PT365_PLAT_MAPPING/MapServer/{layer}/query"
+    payload = safe_public_get(
+        url,
+        {
+            "where": "1=1",
+            "outFields": "*",
+            "returnGeometry": "true",
+            "outSR": 4326,
+            "orderByFields": "UploadDate DESC",
+            "resultRecordCount": min(max(int(max_rows), 100), 2000),
+            "f": "json",
+        },
+        timeout=30,
+    )
+    if not isinstance(payload, dict) or payload.get("_error"):
+        return pd.DataFrame(), (payload.get("_error") if isinstance(payload, dict) else "PlatTracker request failed")
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(int(lookback_days), 1))
+    rows = []
+    for feat in payload.get("features") or []:
+        a = feat.get("attributes") or {}
+        raw_dt = a.get("UploadDate") or a.get("AppSubmitDate") or a.get("PCDate") or a.get("ImportDate")
+        dt = _arcgis_date_to_datetime(raw_dt)
+        if dt and dt < cutoff:
+            continue
+        lat, lon = _ring_center(feat.get("geometry") or {})
+        rows.append({
+            "Subdivision": a.get("SubdivisionName") or a.get("DocName"),
+            "Application": a.get("AppNo") or a.get("AppId"),
+            "Status": a.get("AppStatus") or a.get("RecordationStatus"),
+            "Type": a.get("AppCode"),
+            "Upload Date": dt.date().isoformat() if dt else None,
+            "Lot Count": a.get("LotCount"),
+            "Reserve Count": a.get("ReserveCount"),
+            "Review Cycle": a.get("ReviewCycle"),
+            "Latitude": lat,
+            "Longitude": lon,
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["Lot Count"] = pd.to_numeric(df.get("Lot Count"), errors="coerce")
+        df = df.sort_values("Upload Date", ascending=False, na_position="last").reset_index(drop=True)
+    return df, None
+
+
+def build_transfer_zip_summary(transfer_df, lookback_days=180, long_owner_df=None, census_key=None):
+    if not isinstance(transfer_df, pd.DataFrame) or transfer_df.empty:
+        return pd.DataFrame()
+    df = transfer_df.copy()
+    df["Days Ago"] = pd.to_numeric(df.get("Days Ago"), errors="coerce")
+    half = max(int(lookback_days) // 2, 1)
+    rows = []
+    for z, g in df[df["ZIP"].astype(str).str.len() == 5].groupby("ZIP"):
+        recent = int((g["Days Ago"] <= half).sum())
+        prior = int(((g["Days Ago"] > half) & (g["Days Ago"] <= int(lookback_days))).sum())
+        momentum = ((recent - prior) / prior * 100.0) if prior > 0 else (100.0 if recent > 0 else 0.0)
+        market = pd.to_numeric(g.get("HCAD Market Value"), errors="coerce")
+        rows.append({
+            "ZIP": str(z),
+            "Ownership Changes": int(len(g)),
+            f"Latest {half}d": recent,
+            f"Prior {half}d": prior,
+            "Transfer Momentum %": round(momentum, 1),
+            "Median HCAD Market": market.median() if market.notna().any() else None,
+        })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    if isinstance(long_owner_df, pd.DataFrame) and not long_owner_df.empty and "ZIP" in long_owner_df.columns:
+        long_counts = long_owner_df.groupby("ZIP").size().to_dict()
+        out["Long-owner Leads (sample)"] = out["ZIP"].map(long_counts).fillna(0).astype(int)
+    else:
+        out["Long-owner Leads (sample)"] = 0
+
+    # Relative score only compares areas returned by this scan. It is not a forecast of returns.
+    count_rank = out["Ownership Changes"].rank(pct=True, method="average") * 100
+    momentum_rank = out["Transfer Momentum %"].replace([math.inf, -math.inf], 0).fillna(0).rank(pct=True, method="average") * 100
+    out["Hot Now Score"] = (0.65 * count_rank + 0.35 * momentum_rank).round(0).clip(0, 100)
+
+    if census_key:
+        pops, vacancies, renters, incomes = [], [], [], []
+        for z in out["ZIP"].head(15):
+            profile = census_zip_profile(z, census_key) or {}
+            pops.append(profile.get("population"))
+            vacancies.append((profile.get("vacancy_rate") * 100) if profile.get("vacancy_rate") is not None else None)
+            renters.append((profile.get("renter_rate") * 100) if profile.get("renter_rate") is not None else None)
+            incomes.append(profile.get("median_household_income"))
+        # Pad if more than 15 ZIPs so assignment remains aligned.
+        pad = max(len(out) - len(pops), 0)
+        out["Population"] = pops + [None] * pad
+        out["Vacancy %"] = vacancies + [None] * pad
+        out["Renter %"] = renters + [None] * pad
+        out["Median HH Income"] = incomes + [None] * pad
+    return out.sort_values(["Hot Now Score", "Ownership Changes"], ascending=[False, False]).reset_index(drop=True)
+
+
+def _radar_map_center(*frames):
+    lats, lons = [], []
+    for df in frames:
+        if isinstance(df, pd.DataFrame) and not df.empty and {"Latitude", "Longitude"}.issubset(df.columns):
+            a = pd.to_numeric(df["Latitude"], errors="coerce").dropna().tolist()
+            b = pd.to_numeric(df["Longitude"], errors="coerce").dropna().tolist()
+            lats.extend(a); lons.extend(b)
+    if lats and lons:
+        return float(pd.Series(lats).median()), float(pd.Series(lons).median())
+    return 29.7604, -95.3698
 
 def enrich_area_hcad(df, max_rows=15):
     if df is None or df.empty:
@@ -2833,6 +3125,122 @@ def mean_or_none(df, col):
     return float(s.mean()) if not s.empty else None
 
 
+
+def norvim_comp_arv(comp_frame, subject, subject_zip=None):
+    """Investor-style ARV cross-check from nearby comparable properties already returned by RentCast.
+
+    No extra API call is made. The model prefers same-ZIP, nearby, size-similar comps and
+    weights more similar/closer properties more heavily. It is an underwriting cross-check,
+    not an appraisal.
+    """
+    if comp_frame is None or comp_frame.empty:
+        return {"estimate": None, "confidence": "Unavailable", "count": 0, "comps": pd.DataFrame()}
+    try:
+        subject_sqft = float(subject.get("squareFootage") or 0)
+    except Exception:
+        subject_sqft = 0
+    if subject_sqft <= 0:
+        return {"estimate": None, "confidence": "Unavailable", "count": 0, "comps": pd.DataFrame(), "reason": "Subject square footage is missing."}
+
+    df = comp_frame.copy()
+    for col in ["Price", "Sq Ft", "$/Sq Ft", "Distance (mi)", "Similarity", "Beds", "Baths"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df[(df.get("Price", 0) > 0) & (df.get("Sq Ft", 0) > 0)].copy()
+    if df.empty:
+        return {"estimate": None, "confidence": "Unavailable", "count": 0, "comps": pd.DataFrame()}
+
+    # Prefer same ZIP when there are enough observations; otherwise keep nearby AVM comps.
+    if subject_zip and "ZIP" in df.columns:
+        same = df[df["ZIP"].astype(str) == str(subject_zip)].copy()
+        if len(same) >= 3:
+            df = same
+
+    if "Distance (mi)" in df.columns:
+        close = df[(df["Distance (mi)"].isna()) | (df["Distance (mi)"] <= 1.5)].copy()
+        if len(close) >= 3:
+            df = close
+
+    size_ratio = df["Sq Ft"] / subject_sqft
+    size_similar = df[(size_ratio >= 0.75) & (size_ratio <= 1.25)].copy()
+    if len(size_similar) >= 3:
+        df = size_similar
+
+    subj_beds = subject.get("bedrooms")
+    if subj_beds not in (None, "") and "Beds" in df.columns:
+        try:
+            bed_sim = df[df["Beds"].isna() | ((df["Beds"] - float(subj_beds)).abs() <= 1)].copy()
+            if len(bed_sim) >= 3:
+                df = bed_sim
+        except Exception:
+            pass
+    subj_baths = subject.get("bathrooms")
+    if subj_baths not in (None, "") and "Baths" in df.columns:
+        try:
+            bath_sim = df[df["Baths"].isna() | ((df["Baths"] - float(subj_baths)).abs() <= 1.5)].copy()
+            if len(bath_sim) >= 3:
+                df = bath_sim
+        except Exception:
+            pass
+
+    df = df.copy()
+    df["Adjusted Value"] = (df["Price"] / df["Sq Ft"]) * subject_sqft
+    df = df[df["Adjusted Value"].map(lambda x: pd.notna(x) and math.isfinite(float(x)) and float(x) > 0)].copy()
+    if df.empty:
+        return {"estimate": None, "confidence": "Unavailable", "count": 0, "comps": pd.DataFrame()}
+
+    def row_weight(row):
+        dist = row.get("Distance (mi)")
+        sim = row.get("Similarity")
+        sqft = row.get("Sq Ft")
+        try: dist = float(dist) if pd.notna(dist) else 1.25
+        except Exception: dist = 1.25
+        try: sim = float(sim) if pd.notna(sim) else 0.70
+        except Exception: sim = 0.70
+        try:
+            size_score = max(0.25, 1 - abs(float(sqft) - subject_sqft) / max(subject_sqft, 1))
+        except Exception:
+            size_score = 0.6
+        return max(sim, 0.25) * size_score / (0.25 + max(dist, 0))
+
+    df["NORVIM Weight"] = df.apply(row_weight, axis=1)
+    df = df.sort_values(["NORVIM Weight", "Distance (mi)"], ascending=[False, True], na_position="last").head(8).copy()
+    vals = pd.to_numeric(df["Adjusted Value"], errors="coerce").dropna()
+    if len(vals) >= 5:
+        lo, hi = vals.quantile(0.10), vals.quantile(0.90)
+        trimmed = df[(df["Adjusted Value"] >= lo) & (df["Adjusted Value"] <= hi)].copy()
+        if len(trimmed) >= 3:
+            df = trimmed
+    weights = pd.to_numeric(df["NORVIM Weight"], errors="coerce").fillna(0).clip(lower=0)
+    adjusted = pd.to_numeric(df["Adjusted Value"], errors="coerce")
+    valid = adjusted.notna() & weights.gt(0)
+    if not valid.any():
+        estimate = float(adjusted.dropna().median()) if not adjusted.dropna().empty else None
+    else:
+        estimate = float((adjusted[valid] * weights[valid]).sum() / weights[valid].sum())
+    if estimate is None or not math.isfinite(estimate):
+        return {"estimate": None, "confidence": "Unavailable", "count": 0, "comps": pd.DataFrame()}
+
+    med_dist = median_or_none(df, "Distance (mi)")
+    med_ppsf = median_or_none(df, "$/Sq Ft")
+    count = len(df)
+    if count >= 5 and (med_dist is None or med_dist <= 1.0):
+        confidence = "High"
+    elif count >= 3:
+        confidence = "Medium"
+    else:
+        confidence = "Low"
+    return {
+        "estimate": round(estimate, -3),
+        "raw_estimate": estimate,
+        "confidence": confidence,
+        "count": count,
+        "median_distance": med_dist,
+        "median_ppsf": med_ppsf,
+        "comps": df,
+    }
+
+
 def pct_diff(a, b):
     try:
         if b in (None, 0): return None
@@ -2884,7 +3292,7 @@ def history_df(data):
                 })
     return pd.DataFrame(rows).sort_values("Period") if rows else pd.DataFrame()
 
-st.markdown('<div class="k">NORVIM 13 LLC</div><div class="t">DealFinder 2.5.4</div><div class="s">Automatic Analysis → active Area Scout + free Off-Market Map → cache-first or 0-call underwriting → pipeline.</div>', unsafe_allow_html=True)
+st.markdown('<div class="k">NORVIM 13 LLC</div><div class="t">DealFinder 2.7</div><div class="s">Automatic Analysis → Area Opportunity Radar + active Area Scout + Off-Market Map + Owner Portfolio → NORVIM Comp ARV → cache-first or 0-call underwriting → pipeline.</div>', unsafe_allow_html=True)
 
 
 app_access_code = str(get_setting("APP_ACCESS_CODE", "") or "").strip()
@@ -2955,6 +3363,15 @@ def open_full_analyzer_from_scout(address, strategy=None, purchase=None):
     st.session_state["workflow_mode"] = "Analyze Property"
 
 
+
+
+def set_money_widget_value(widget_key, value):
+    """Safe callback helper for money text-input widgets."""
+    try:
+        st.session_state[str(widget_key)] = f"{float(value):,.0f}"
+    except Exception:
+        pass
+
 # -----------------------------------------------------------------------------
 # AUTOMATIC ANALYSIS WORKFLOW
 # -----------------------------------------------------------------------------
@@ -2962,11 +3379,383 @@ if "workflow_mode" not in st.session_state:
     st.session_state["workflow_mode"] = "Analyze Property"
 workflow_mode = st.radio(
     "Automatic analysis",
-    ["Analyze Property", "Find Deals by Area", "Off-Market Map"],
+    ["Analyze Property", "Area Radar", "Find Deals by Area", "Off-Market Map", "Owner Portfolio"],
     horizontal=True,
     key="workflow_mode",
-    help="Analyze one address, scan active listings by area, or browse free HCAD off-market leads before using paid data.",
+    help="Analyze one address, scan free Houston market signals, scan active listings, browse HCAD off-market leads, or search public HCAD parcels by owner name.",
 )
+
+
+
+if workflow_mode == "Area Radar":
+    st.markdown("### Area Opportunity Radar")
+    st.caption(
+        "Free/public Houston market radar. It uses HCAD ownership-change dates as a transaction-activity proxy, "
+        "City of Houston PlatTracker as a development-pipeline signal, Census context when your Census key is available, "
+        "and a sampled long-time-owner pool from HCAD. It uses 0 RentCast calls."
+    )
+    with st.container(border=True):
+        rr1, rr2, rr3, rr4 = st.columns([1.7, 1.0, 1.0, 1.0])
+        with rr1:
+            radar_zip_raw = st.text_input(
+                "ZIP codes (optional)",
+                key="radar_zip_raw",
+                placeholder="Blank = Houston-wide sample, or 77022, 77021, 77051",
+                help="Leave blank for a capped Houston-wide public-record sample. Enter ZIPs for more focused comparisons.",
+            )
+        with rr2:
+            radar_days = st.selectbox("Lookback", [90, 180, 365], index=1, key="radar_days", format_func=lambda x: f"{x} days")
+        with rr3:
+            radar_long_years = st.selectbox("Long-owner threshold", [10, 15, 20, 25], index=1, key="radar_long_years", format_func=lambda x: f"{x}+ years")
+        with rr4:
+            st.write("")
+            st.write("")
+            radar_run = st.button("Run free market radar", type="primary", use_container_width=True, key="radar_run")
+
+    radar_zips = _parse_zip_tokens(radar_zip_raw)
+    if radar_run:
+        with st.spinner("Reading HCAD ownership activity, Houston plats and long-owner records..."):
+            transfers, transfer_meta = hcad_recent_transfer_activity(radar_zips, radar_days, 1000 if not radar_zips else 750)
+            plats, plat_err = houston_plat_activity(radar_days, 1200, False)
+            final_plats, final_err = houston_plat_activity(radar_days, 1000, True)
+            long_owners, long_err = hcad_offmarket_candidates(radar_zips, radar_long_years, 0, 500)
+            summary = build_transfer_zip_summary(transfers, radar_days, long_owners, str(get_setting("CENSUS_API_KEY", "") or "").strip())
+        st.session_state["radar_transfers"] = transfers
+        st.session_state["radar_transfer_meta"] = transfer_meta
+        st.session_state["radar_plats"] = plats
+        st.session_state["radar_final_plats"] = final_plats
+        st.session_state["radar_long_owners"] = long_owners
+        st.session_state["radar_summary"] = summary
+        st.session_state["radar_errors"] = [e for e in [plat_err, final_err, long_err] if e]
+        st.session_state["radar_scope_text"] = ", ".join(radar_zips) if radar_zips else "Houston-wide capped sample"
+        st.session_state["radar_days_used"] = int(radar_days)
+
+    transfers = st.session_state.get("radar_transfers")
+    plats = st.session_state.get("radar_plats")
+    final_plats = st.session_state.get("radar_final_plats")
+    long_owners = st.session_state.get("radar_long_owners")
+    summary = st.session_state.get("radar_summary")
+    tmeta = st.session_state.get("radar_transfer_meta") or {}
+    radar_errors = st.session_state.get("radar_errors") or []
+    used_days = int(st.session_state.get("radar_days_used") or radar_days)
+
+    if isinstance(transfers, pd.DataFrame):
+        half = max(used_days // 2, 1)
+        recent_n = int((pd.to_numeric(transfers.get("Days Ago"), errors="coerce") <= half).sum()) if not transfers.empty else 0
+        prior_n = int(((pd.to_numeric(transfers.get("Days Ago"), errors="coerce") > half) & (pd.to_numeric(transfers.get("Days Ago"), errors="coerce") <= used_days)).sum()) if not transfers.empty else 0
+        trend = ((recent_n - prior_n) / prior_n * 100.0) if prior_n > 0 else (100.0 if recent_n > 0 else 0.0)
+        lot_total = pd.to_numeric(plats.get("Lot Count"), errors="coerce").sum(min_count=1) if isinstance(plats, pd.DataFrame) and not plats.empty else None
+        c1, c2, c3, c4, c5 = st.columns(5)
+        with c1: result_card("Ownership changes", f"{len(transfers):,}", f"HCAD proxy · last {used_days} days")
+        with c2: result_card("Activity trend", f"{trend:+.0f}%", f"latest {half}d vs prior {half}d")
+        with c3: result_card("Plat applications", f"{len(plats):,}" if isinstance(plats, pd.DataFrame) else "—", "Development pipeline")
+        with c4: result_card("Lots in applications", f"{float(lot_total):,.0f}" if pd.notna(lot_total) else "—", "Where PlatTracker reports lot count")
+        with c5: result_card("Long-owner leads", f"{len(long_owners):,}" if isinstance(long_owners, pd.DataFrame) else "—", f"Sample · {radar_long_years}+ years")
+
+        st.caption(
+            "Ownership changes are not the same as verified arms-length sales. HCAD new-owner dates can include other transfers. "
+            "Houston-wide HCAD results are intentionally capped for speed; ZIP-specific scans are more useful for comparing target areas."
+        )
+        if tmeta.get("truncated"):
+            st.warning("HCAD reached the public-record row cap in at least one scope. Treat the counts as a capped activity sample, not a complete transaction count.")
+        if tmeta.get("errors"):
+            st.caption("HCAD notes: " + " | ".join(tmeta.get("errors")))
+        if radar_errors:
+            st.caption("Public-data notes: " + " | ".join(str(x) for x in radar_errors))
+
+        hot_tab, next_tab, supply_tab = st.tabs(["🔥 Hot now", "🏗️ Coming next", "🏠 Deal supply"])
+
+        with hot_tab:
+            st.markdown("#### Where ownership activity is moving")
+            st.caption("Hot Now Score is a relative screening score from ownership-change volume and recent-vs-prior activity within this scan. It is not a forecast of appreciation or a recommendation to buy.")
+            if isinstance(summary, pd.DataFrame) and not summary.empty:
+                show = summary.copy()
+                fmt = {
+                    "Median HCAD Market": "${:,.0f}",
+                    "Transfer Momentum %": "{:+.1f}%",
+                    "Hot Now Score": "{:.0f}",
+                    "Population": "{:,.0f}",
+                    "Vacancy %": "{:.1f}%",
+                    "Renter %": "{:.1f}%",
+                    "Median HH Income": "${:,.0f}",
+                }
+                try:
+                    st.dataframe(show.style.format(fmt, na_rep="—"), use_container_width=True, hide_index=True)
+                except Exception:
+                    st.dataframe(show, use_container_width=True, hide_index=True)
+            else:
+                st.info("No ZIP-level ownership activity was returned for the selected scope and lookback.")
+
+            transfer_map = transfers.dropna(subset=["Latitude", "Longitude"]).copy() if not transfers.empty else pd.DataFrame()
+            if not transfer_map.empty:
+                transfer_map["Market Text"] = pd.to_numeric(transfer_map.get("HCAD Market Value"), errors="coerce").apply(lambda x: money(x) if pd.notna(x) else "—")
+                center_lat, center_lon = _radar_map_center(transfer_map)
+                heat = pdk.Layer(
+                    "HeatmapLayer",
+                    data=transfer_map.head(1000),
+                    get_position="[Longitude, Latitude]",
+                    get_weight=1,
+                    radius_pixels=45,
+                    intensity=1,
+                    threshold=0.03,
+                    pickable=False,
+                )
+                dots = pdk.Layer(
+                    "ScatterplotLayer",
+                    id="radar-transfers",
+                    data=transfer_map.head(1000),
+                    get_position="[Longitude, Latitude]",
+                    get_radius=70,
+                    radius_min_pixels=3,
+                    radius_max_pixels=8,
+                    get_fill_color=[61, 120, 184, 175],
+                    get_line_color=[255, 255, 255, 220],
+                    line_width_min_pixels=1,
+                    pickable=True,
+                    auto_highlight=True,
+                    stroked=True,
+                )
+                evt = st.pydeck_chart(
+                    pdk.Deck(
+                        layers=[heat, dots],
+                        initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=10.3 if not radar_zips else 11.5, pitch=0, controller=True),
+                        map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+                        tooltip={"html":"<b>{Address}</b><br/>ZIP {ZIP}<br/>Ownership change: {Ownership Change}<br/>HCAD market: {Market Text}<br/>Owner: {Owner}<br/><br/><b>Click to select.</b>","style":{"backgroundColor":"#252A24","color":"white"}},
+                    ),
+                    use_container_width=True,
+                    height=590,
+                    on_select="rerun",
+                    selection_mode="single-object",
+                    key="norvim_radar_transfer_map",
+                )
+                try:
+                    picked = evt.selection.get("objects", {}).get("radar-transfers", [])
+                    if picked:
+                        st.session_state["radar_selected_transfer"] = picked[0]
+                except Exception:
+                    pass
+                selected_transfer = st.session_state.get("radar_selected_transfer")
+                if isinstance(selected_transfer, dict) and selected_transfer.get("Address"):
+                    st.markdown("##### Selected ownership-change property")
+                    s1, s2, s3 = st.columns(3)
+                    with s1: result_card("Address", selected_transfer.get("Address"))
+                    with s2: result_card("Ownership change", selected_transfer.get("Ownership Change") or "—")
+                    with s3: result_card("HCAD market", selected_transfer.get("Market Text") or money(selected_transfer.get("HCAD Market Value")))
+                    st.button(
+                        "Open selected property in Full Analyzer",
+                        type="primary",
+                        use_container_width=True,
+                        key="radar_transfer_analyze",
+                        on_click=open_full_analyzer_from_scout,
+                        args=(selected_transfer.get("Address"), None, None),
+                    )
+
+        with next_tab:
+            st.markdown("#### Development pipeline")
+            st.caption("Orange = current/recent plat applications. Green = final plats. Larger bubbles indicate more lots when PlatTracker reports a lot count. These are development signals, not guarantees that construction will occur on a specific schedule.")
+            pmap = plats.dropna(subset=["Latitude", "Longitude"]).copy() if isinstance(plats, pd.DataFrame) and not plats.empty else pd.DataFrame()
+            fmap = final_plats.dropna(subset=["Latitude", "Longitude"]).copy() if isinstance(final_plats, pd.DataFrame) and not final_plats.empty else pd.DataFrame()
+            center_lat, center_lon = _radar_map_center(pmap, fmap)
+            layers = []
+            if not pmap.empty:
+                pmap["Lot Weight"] = pd.to_numeric(pmap.get("Lot Count"), errors="coerce").fillna(1).clip(lower=1, upper=100)
+                layers.append(pdk.Layer(
+                    "ScatterplotLayer", id="radar-plats", data=pmap.head(1000), get_position="[Longitude, Latitude]",
+                    get_radius="70 + Lot Weight * 5", radius_min_pixels=6, radius_max_pixels=22,
+                    get_fill_color=[214, 137, 63, 190], get_line_color=[255,255,255,220], line_width_min_pixels=1,
+                    pickable=True, auto_highlight=True, stroked=True,
+                ))
+            if not fmap.empty:
+                layers.append(pdk.Layer(
+                    "ScatterplotLayer", id="radar-final-plats", data=fmap.head(1000), get_position="[Longitude, Latitude]",
+                    get_radius=85, radius_min_pixels=5, radius_max_pixels=14,
+                    get_fill_color=[89, 130, 79, 185], get_line_color=[255,255,255,220], line_width_min_pixels=1,
+                    pickable=True, auto_highlight=True, stroked=True,
+                ))
+            if layers:
+                st.pydeck_chart(
+                    pdk.Deck(
+                        layers=layers,
+                        initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=10.2, pitch=0, controller=True),
+                        map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+                        tooltip={"html":"<b>{Subdivision}</b><br/>Application: {Application}<br/>Status: {Status}<br/>Type: {Type}<br/>Upload: {Upload Date}<br/>Lots: {Lot Count}","style":{"backgroundColor":"#252A24","color":"white"}},
+                    ),
+                    use_container_width=True,
+                    height=590,
+                    key="norvim_radar_development_map",
+                )
+            else:
+                st.info("No PlatTracker geometry was returned for this lookback.")
+            if isinstance(plats, pd.DataFrame) and not plats.empty:
+                st.markdown("##### Recent plat applications")
+                pcols = [c for c in ["Subdivision","Application","Status","Type","Upload Date","Lot Count","Reserve Count","Review Cycle"] if c in plats.columns]
+                st.dataframe(plats[pcols].head(100), use_container_width=True, hide_index=True)
+
+        with supply_tab:
+            st.markdown("#### Off-market deal supply")
+            st.caption(f"Sample of HCAD parcels with {radar_long_years}+ years since the recorded ownership change. This is a prospecting pool—not evidence that an owner wants to sell or is distressed.")
+            if isinstance(long_owners, pd.DataFrame) and not long_owners.empty:
+                smap = long_owners.dropna(subset=["Latitude", "Longitude"]).copy()
+                if not smap.empty:
+                    smap["Market Text"] = pd.to_numeric(smap.get("HCAD Market Value"), errors="coerce").apply(lambda x: money(x) if pd.notna(x) else "—")
+                    center_lat, center_lon = _radar_map_center(smap)
+                    layer = pdk.Layer(
+                        "ScatterplotLayer", id="radar-supply", data=smap.head(500), get_position="[Longitude, Latitude]",
+                        get_radius=80, radius_min_pixels=5, radius_max_pixels=12,
+                        get_fill_color=[126, 92, 120, 185], get_line_color=[255,255,255,225], line_width_min_pixels=1,
+                        pickable=True, auto_highlight=True, stroked=True,
+                    )
+                    sev = st.pydeck_chart(
+                        pdk.Deck(
+                            layers=[layer],
+                            initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=10.3 if not radar_zips else 11.5, pitch=0, controller=True),
+                            map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+                            tooltip={"html":"<b>{Address}</b><br/>Owner: {Owner}<br/>Years owned: {Years Owned}<br/>{Occupancy Proxy}<br/>HCAD market: {Market Text}<br/><br/><b>Click to select.</b>","style":{"backgroundColor":"#252A24","color":"white"}},
+                        ),
+                        use_container_width=True,
+                        height=560,
+                        on_select="rerun",
+                        selection_mode="single-object",
+                        key="norvim_radar_supply_map",
+                    )
+                    try:
+                        picked = sev.selection.get("objects", {}).get("radar-supply", [])
+                        if picked:
+                            st.session_state["radar_selected_supply"] = picked[0]
+                    except Exception:
+                        pass
+                    supply_pick = st.session_state.get("radar_selected_supply")
+                    if isinstance(supply_pick, dict) and supply_pick.get("Address"):
+                        st.button(
+                            "Open selected off-market lead in Full Analyzer",
+                            type="primary",
+                            use_container_width=True,
+                            key="radar_supply_analyze",
+                            on_click=open_full_analyzer_from_scout,
+                            args=(supply_pick.get("Address"), None, None),
+                        )
+                cols = [c for c in ["Lead Score","Address","ZIP","Owner","Years Owned","Occupancy Proxy","HCAD Market Value","Tax Value","Land Sq Ft"] if c in long_owners.columns]
+                try:
+                    st.dataframe(long_owners[cols].head(100).style.format({"HCAD Market Value":"${:,.0f}","Tax Value":"${:,.0f}","Land Sq Ft":"{:,.0f}"}, na_rep="—"), use_container_width=True, hide_index=True)
+                except Exception:
+                    st.dataframe(long_owners[cols].head(100), use_container_width=True, hide_index=True)
+            else:
+                st.info("No long-owner lead sample was returned for this scope.")
+    else:
+        st.info("Choose a lookback and click **Run free market radar**. Leave ZIP blank for a Houston-wide sample or enter ZIPs to compare target areas.")
+
+    st.stop()
+
+if workflow_mode == "Owner Portfolio":
+    st.markdown("### Owner Portfolio Search")
+    st.caption(
+        "Type an owner name to search official Harris County Appraisal District parcel records. "
+        "This uses 0 RentCast calls. Results are public-record name matches—not identity verification—and common names can include unrelated owners."
+    )
+    with st.container(border=True):
+        op1, op2, op3 = st.columns([2.2, 1.0, 1.0])
+        with op1:
+            owner_query = st.text_input("Owner name", key="owner_portfolio_query", placeholder="Example: SMITH JOHN or ABC INVESTMENTS LLC")
+        with op2:
+            owner_limit = st.selectbox("Maximum parcels", [50, 100, 250, 500], index=2, key="owner_portfolio_limit")
+        with op3:
+            st.write("")
+            st.write("")
+            owner_search_btn = st.button("Search owner", type="primary", use_container_width=True, key="owner_portfolio_search")
+    if owner_search_btn:
+        with st.spinner("Searching HCAD owner records..."):
+            odf, oerr = hcad_owner_portfolio(owner_query, owner_limit)
+        if oerr:
+            st.error(oerr)
+        else:
+            st.session_state["owner_portfolio_df"] = odf
+            st.session_state["owner_portfolio_term"] = owner_query
+
+    owner_df = st.session_state.get("owner_portfolio_df")
+    if isinstance(owner_df, pd.DataFrame) and not owner_df.empty:
+        market_vals = pd.to_numeric(owner_df.get("HCAD Market Value"), errors="coerce")
+        zip_count = owner_df.get("ZIP", pd.Series(dtype=str)).replace("", pd.NA).dropna().nunique()
+        o1,o2,o3,o4=st.columns(4)
+        with o1: result_card("Parcels matched", f"{len(owner_df):,}")
+        with o2: result_card("HCAD market value", money(market_vals.sum()) if market_vals.notna().any() else "—", "Sum of matched parcels")
+        with o3: result_card("ZIPs represented", f"{zip_count:,}")
+        with o4: result_card("RentCast calls", "0", "HCAD public data")
+        st.warning("A name match does not prove the parcels belong to the same person or entity. Verify account records, deeds/title and entity names before relying on a portfolio total.")
+
+        owner_map = owner_df.dropna(subset=["Latitude", "Longitude"]).copy()
+        if not owner_map.empty:
+            center_lat = float(pd.to_numeric(owner_map["Latitude"], errors="coerce").median())
+            center_lon = float(pd.to_numeric(owner_map["Longitude"], errors="coerce").median())
+            owner_map["Market Text"] = pd.to_numeric(owner_map["HCAD Market Value"], errors="coerce").apply(lambda x: money(x) if pd.notna(x) else "—")
+            owner_map["Years Text"] = pd.to_numeric(owner_map["Years Owned"], errors="coerce").apply(lambda x: f"{x:.1f} years" if pd.notna(x) else "—")
+            owner_layer = pdk.Layer(
+                "ScatterplotLayer",
+                id="owner-portfolio-parcels",
+                data=owner_map.head(500),
+                get_position="[Longitude, Latitude]",
+                get_radius=110,
+                get_fill_color=[89, 99, 79, 205],
+                get_line_color=[255,255,255,220],
+                line_width_min_pixels=1,
+                radius_min_pixels=7,
+                radius_max_pixels=18,
+                pickable=True,
+                auto_highlight=True,
+                stroked=True,
+            )
+            owner_event = st.pydeck_chart(
+                pdk.Deck(
+                    layers=[owner_layer],
+                    initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=9.5, pitch=0, controller=True),
+                    map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+                    tooltip={"html":"<b>{Address}</b><br/>Owner: {Owner 1}<br/>HCAD market: {Market Text}<br/>Owned: {Years Text}<br/>{Occupancy Proxy}<br/><br/><b>Click to select.</b>","style":{"backgroundColor":"#252A24","color":"white"}},
+                ),
+                use_container_width=True,
+                height=560,
+                on_select="rerun",
+                selection_mode="single-object",
+                key="norvim_owner_portfolio_map",
+            )
+            try:
+                objects = owner_event.selection.get("objects", {})
+                picked_rows = objects.get("owner-portfolio-parcels", [])
+                if picked_rows:
+                    addr = str(picked_rows[0].get("Address") or "").strip()
+                    if addr:
+                        st.session_state["owner_selected_address"] = addr
+            except Exception:
+                pass
+
+        display_cols = [c for c in ["Address","ZIP","Owner 1","Owner 2","Years Owned","Occupancy Proxy","HCAD Market Value","HCAD Appraised","Tax Value","Land Value","Building Value","Land Sq Ft","Mailing Address","Account"] if c in owner_df.columns]
+        st.dataframe(
+            owner_df[display_cols].style.format({"HCAD Market Value":"${:,.0f}","HCAD Appraised":"${:,.0f}","Tax Value":"${:,.0f}","Land Value":"${:,.0f}","Building Value":"${:,.0f}","Land Sq Ft":"{:,.0f}"}, na_rep="—"),
+            use_container_width=True,
+            hide_index=True,
+        )
+        addresses = owner_df["Address"].dropna().astype(str).tolist()
+        if addresses:
+            selected_owner_property = st.selectbox("Select a property", addresses, key="owner_selected_address")
+            prow = owner_df[owner_df["Address"].astype(str) == selected_owner_property].iloc[0]
+            with st.container(border=True):
+                q1,q2,q3,q4=st.columns(4)
+                with q1: result_card("Owner", str(prow.get("Owner 1") or "—"), str(prow.get("Owner 2") or ""))
+                with q2: result_card("HCAD market", money(prow.get("HCAD Market Value")))
+                with q3: result_card("Years owned", f"{float(prow.get('Years Owned')):.1f}" if pd.notna(prow.get("Years Owned")) else "—")
+                with q4: result_card("Land", f"{float(prow.get('Land Sq Ft')):,.0f} sqft" if pd.notna(prow.get("Land Sq Ft")) else "—")
+                st.caption(f"Mailing address: {prow.get('Mailing Address') or '—'} · Account: {prow.get('Account') or '—'} · Occupancy proxy: {prow.get('Occupancy Proxy') or '—'}")
+            st.button(
+                "Open selected property in Full Analyzer",
+                type="primary",
+                use_container_width=True,
+                key="open_owner_property",
+                on_click=open_full_analyzer_from_scout,
+                args=(selected_owner_property,),
+            )
+    elif owner_search_btn:
+        st.info("No HCAD parcel matches were returned for that name. Try fewer words or the assessor-style name order (for example, LAST FIRST).")
+    else:
+        st.info("Search a person, trust, or company name to see matching Harris County parcels on one map.")
+    st.stop()
 
 if workflow_mode == "Off-Market Map":
     st.markdown("### Off-Market Map Scout")
@@ -3870,6 +4659,17 @@ if is_manual_analysis:
 else:
     st.info(f'Quick Scan snapshot: {A.get("quick_fetched_at") or A["time"]} · source: {A.get("cache_source","cache")}. New addresses use ARV + rent only (2 RentCast endpoints); fresh NORVIM-cached addresses use 0.')
 st.warning("Underwriting estimate only. Verify title, condition, flood risk, taxes, liens, repair scope and local comps before contracting.")
+if norvim_comp_arv_value:
+    st.info(
+        f"NORVIM Comp ARV: {money(norvim_comp_arv_value)} · {comp_arv_result.get('confidence')} confidence · "
+        f"{comp_arv_result.get('count',0)} weighted nearby comps · 0 extra API calls (uses the comps already returned with Quick Scan)."
+    )
+    st.button(
+        f"Use NORVIM Comp ARV ({money(norvim_comp_arv_value)})",
+        key="use_norvim_comp_arv_top",
+        on_click=set_money_widget_value,
+        args=(arv_widget_key, norvim_comp_arv_value),
+    )
 
 tabs=st.tabs(["DealFinder","Property record","Listing","Deal","BRRRR","Sales comps","Neighborhood map","Area market","Rental","Section 8","Export","Strategy Match","Offer Lab","Neighborhood Intel","CRM"])
 
@@ -3902,6 +4702,9 @@ else:
 # did not return any same-ZIP records.
 cdf = cdf_same_zip.copy() if not cdf_same_zip.empty else cdf_all.copy()
 comp_scope_fallback = cdf_same_zip.empty and not cdf_all.empty
+
+comp_arv_result = norvim_comp_arv(cdf_all, subj, zip_code if zip_code != "—" else None)
+norvim_comp_arv_value = comp_arv_result.get("estimate")
 
 subject_ppsf=(float(arv)/float(subj.get("squareFootage")) if arv and subj.get("squareFootage") else None)
 comp_median_price=median_or_none(cdf,"Price")
@@ -4579,6 +5382,28 @@ with tabs[4]:
 
 
 with tabs[5]:
+    st.markdown("#### NORVIM Comp ARV")
+    if norvim_comp_arv_value:
+        ca1,ca2,ca3,ca4=st.columns(4)
+        with ca1: result_card("NORVIM Comp ARV", money(norvim_comp_arv_value))
+        with ca2: result_card("Confidence", comp_arv_result.get("confidence") or "—")
+        with ca3: result_card("Weighted comps", f"{comp_arv_result.get('count',0):,}")
+        with ca4: result_card("Median distance", f"{comp_arv_result.get('median_distance'):.2f} mi" if comp_arv_result.get("median_distance") is not None else "—")
+        st.caption("NORVIM converts each comparable's $/sqft to the subject's square footage, then weights closer, more similar-size and higher-similarity comps more heavily. It is an underwriting cross-check, not an appraisal.")
+        st.button(
+            f"Use {money(norvim_comp_arv_value)} as Underwriting ARV",
+            key="use_norvim_comp_arv_sales",
+            type="primary",
+            on_click=set_money_widget_value,
+            args=(arv_widget_key, norvim_comp_arv_value),
+        )
+        comp_model_df = comp_arv_result.get("comps")
+        if isinstance(comp_model_df, pd.DataFrame) and not comp_model_df.empty:
+            show_cols=[c for c in ["Address","ZIP","Price","Beds","Baths","Sq Ft","$/Sq Ft","Distance (mi)","Similarity","Adjusted Value","NORVIM Weight"] if c in comp_model_df.columns]
+            st.dataframe(comp_model_df[show_cols].style.format({"Price":"${:,.0f}","$/Sq Ft":"${:,.2f}","Distance (mi)":"{:.2f}","Similarity":"{:.0%}","Adjusted Value":"${:,.0f}","NORVIM Weight":"{:.2f}"},na_rep="—"),use_container_width=True,hide_index=True)
+    else:
+        st.info("NORVIM Comp ARV needs subject square footage plus comparable sales/listings. Automatic Quick Scan normally supplies these with no extra call beyond the normal ARV lookup.")
+    st.divider()
     st.markdown("#### Comparable houses around the subject")
     if cdf_all.empty:
         st.info("No sales comps returned.")
@@ -5299,4 +6124,4 @@ with tabs[14]:
             st.caption("No saved pipeline records yet.")
 
 
-st.caption("NORVIM DealFinder 2.5.4 · active + off-market scouting · HUD diagnostics · cache-first automatic analysis + 0-call Manual / Free Mode · strategy matching · neighborhood intelligence · CRM.")
+st.caption("NORVIM DealFinder 2.6 · active + off-market scouting · HUD diagnostics · cache-first automatic analysis + 0-call Manual / Free Mode · strategy matching · neighborhood intelligence · CRM.")
