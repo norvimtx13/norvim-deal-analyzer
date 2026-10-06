@@ -15,7 +15,7 @@ HCAD_PARCEL_URL = "https://www.gis.hctx.net/arcgis/rest/services/HCAD/Parcels/Ma
 NCES_SCHOOLS_URL = "https://nces.ed.gov/opengis/rest/services/K12_School_Locations/EDGE_GEOCODE_PUBLICSCH_2425/MapServer/0/query"
 HUD_FMR_API_BASE = "https://www.huduser.gov/hudapi/public/fmr"
 
-st.set_page_config(page_title="NORVIM DealFinder 2.5.3", page_icon="🏠", layout="wide")
+st.set_page_config(page_title="NORVIM DealFinder 2.5.4", page_icon="🏠", layout="wide")
 st.markdown("""
 <style>
 :root { color-scheme: light !important; }
@@ -198,19 +198,23 @@ def _format_money_state(key):
     st.session_state[key] = f"{value:,.0f}"
 
 
-def money_input(label, default=0.0, key=None, help=None):
-    """Dollar input that keeps thousands separators visible for easier underwriting."""
+def money_input(label, default=0.0, key=None, help=None, allow_callback=True):
+    """Dollar input with readable thousands separators.
+
+    Streamlit does not allow callbacks on widgets inside a form (except the
+    form submit button), so callers inside st.form must set
+    allow_callback=False. The value still parses normally in that mode.
+    """
     if not key:
         key = "money_" + re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
     if key not in st.session_state:
         st.session_state[key] = f"{float(default):,.0f}"
-    raw = st.text_input(
-        label,
-        key=key,
-        help=help,
-        on_change=_format_money_state,
-        args=(key,),
-    )
+
+    kwargs = {"key": key, "help": help}
+    if allow_callback:
+        kwargs.update({"on_change": _format_money_state, "args": (key,)})
+
+    raw = st.text_input(label, **kwargs)
     return parse_money_input(raw, default)
 
 
@@ -2880,7 +2884,7 @@ def history_df(data):
                 })
     return pd.DataFrame(rows).sort_values("Period") if rows else pd.DataFrame()
 
-st.markdown('<div class="k">NORVIM 13 LLC</div><div class="t">DealFinder 2.5.3</div><div class="s">Automatic Analysis → active Area Scout + free Off-Market Map → cache-first or 0-call underwriting → pipeline.</div>', unsafe_allow_html=True)
+st.markdown('<div class="k">NORVIM 13 LLC</div><div class="t">DealFinder 2.5.4</div><div class="s">Automatic Analysis → active Area Scout + free Off-Market Map → cache-first or 0-call underwriting → pipeline.</div>', unsafe_allow_html=True)
 
 
 app_access_code = str(get_setting("APP_ACCESS_CODE", "") or "").strip()
@@ -3675,9 +3679,9 @@ with st.form("address_form"):
         st.caption("Manual / Free Mode uses 0 RentCast calls. Enter the numbers you want NORVIM to underwrite; free/public neighborhood sources can still load when the address can be geocoded.")
         f1, f2, f3 = st.columns(3)
         with f1:
-            manual_arv_input = money_input("ARV / expected sale value ($)", 0, key="manual_free_arv")
+            manual_arv_input = money_input("ARV / expected sale value ($)", 0, key="manual_free_arv", allow_callback=False)
         with f2:
-            manual_rent_input = money_input("Market rent estimate ($/mo)", 0, key="manual_free_rent")
+            manual_rent_input = money_input("Market rent estimate ($/mo)", 0, key="manual_free_rent", allow_callback=False)
         with f3:
             manual_zip_input = st.text_input("ZIP code", value="", key="manual_free_zip", help="Optional if the full ZIP is already in the address.")
         f4, f5, f6, f7, f8 = st.columns(5)
@@ -5295,4 +5299,4 @@ with tabs[14]:
             st.caption("No saved pipeline records yet.")
 
 
-st.caption("NORVIM DealFinder 2.5.3 · active + off-market scouting · HUD diagnostics · cache-first automatic analysis + 0-call Manual / Free Mode · strategy matching · neighborhood intelligence · CRM.")
+st.caption("NORVIM DealFinder 2.5.4 · active + off-market scouting · HUD diagnostics · cache-first automatic analysis + 0-call Manual / Free Mode · strategy matching · neighborhood intelligence · CRM.")
