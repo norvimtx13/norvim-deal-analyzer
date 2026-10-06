@@ -15,7 +15,7 @@ HCAD_PARCEL_URL = "https://www.gis.hctx.net/arcgis/rest/services/HCAD/Parcels/Ma
 NCES_SCHOOLS_URL = "https://nces.ed.gov/opengis/rest/services/K12_School_Locations/EDGE_GEOCODE_PUBLICSCH_2425/MapServer/0/query"
 HUD_FMR_API_BASE = "https://www.huduser.gov/hudapi/public/fmr"
 
-st.set_page_config(page_title="NORVIM DealFinder 2.5.2", page_icon="🏠", layout="wide")
+st.set_page_config(page_title="NORVIM DealFinder 2.5.3", page_icon="🏠", layout="wide")
 st.markdown("""
 <style>
 :root { color-scheme: light !important; }
@@ -553,7 +553,7 @@ def db_monthly_api_usage():
 
 def safe_public_get(url, params=None, timeout=18):
     try:
-        r = requests.get(url, params=params or {}, timeout=timeout, headers={"User-Agent": "NORVIM-DealFinder/2.5.2"})
+        r = requests.get(url, params=params or {}, timeout=timeout, headers={"User-Agent": "NORVIM-DealFinder/2.5.3"})
         if not r.ok:
             return {"_error": f"HTTP {r.status_code}"}
         data = r.json()
@@ -730,7 +730,7 @@ def hud_api_get(path, token, params=None, timeout=20):
             f"{HUD_FMR_API_BASE}{path}",
             params=params or {},
             timeout=timeout,
-            headers={"Accept": "application/json", "Authorization": f"Bearer {token}", "User-Agent": "NORVIM-DealFinder/2.5.2"},
+            headers={"Accept": "application/json", "Authorization": f"Bearer {token}", "User-Agent": "NORVIM-DealFinder/2.5.3"},
         )
         if not r.ok:
             detail = ""
@@ -1548,62 +1548,93 @@ def hcad_offmarket_candidates(zip_codes=None, min_years_owned=15, max_market_val
     return df, None
 
 def score_area_candidates(df, strategy, hud_profiles=None, finance=None):
-    """Preliminary area-screen score. It is intentionally not an ARV or appraisal."""
+    """Preliminary area-screen score. It is intentionally not an ARV or appraisal.
+
+    The scorer is defensive against missing/NaN/infinite values returned by listing,
+    HUD, or public-data sources so one incomplete property cannot crash Area Scout.
+    """
     if df is None or df.empty:
         return pd.DataFrame()
+
+    def finite_num(value, default=None):
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return default
+        return num if math.isfinite(num) else default
+
     out = df.copy()
-    valid_ppsf = pd.to_numeric(out["$/Sq Ft"], errors="coerce")
-    median_ppsf = float(valid_ppsf.median()) if valid_ppsf.notna().any() else None
+    valid_ppsf = pd.to_numeric(out.get("$/Sq Ft", pd.Series(dtype=float)), errors="coerce")
+    valid_ppsf = valid_ppsf[valid_ppsf.map(lambda x: math.isfinite(float(x)) if pd.notna(x) else False)]
+    median_ppsf = finite_num(valid_ppsf.median()) if not valid_ppsf.empty else None
     hud_profiles = hud_profiles or {}
     finance = finance or {}
     scores, notes, hud_rents, s8_cf = [], [], [], []
+
     for _, row in out.iterrows():
-        ppsf = row.get("$/Sq Ft")
-        dom = row.get("DOM")
+        ppsf = finite_num(row.get("$/Sq Ft"))
+        dom = finite_num(row.get("DOM"))
         score = 45.0
         note_parts = []
-        if median_ppsf and pd.notna(ppsf):
-            discount = (median_ppsf - float(ppsf)) / median_ppsf
-            score += max(min(discount * 120, 30), -25)
-            if discount >= 0.10:
-                note_parts.append(f"{discount*100:.0f}% below area median $/sf")
-        if pd.notna(dom):
-            dom = float(dom)
+
+        if median_ppsf and median_ppsf > 0 and ppsf is not None:
+            discount = (median_ppsf - ppsf) / median_ppsf
+            if math.isfinite(discount):
+                score += max(min(discount * 120, 30), -25)
+                if discount >= 0.10:
+                    note_parts.append(f"{discount*100:.0f}% below area median $/sf")
+
+        if dom is not None:
             score += min(max(dom - 20, 0) / 4, 20)
             if dom >= 60:
                 note_parts.append(f"{dom:.0f} DOM")
+
         hud_rent = 0.0
         cf = None
         if strategy == "Section 8":
             profile = hud_profiles.get(str(row.get("ZIP") or "")) or {}
-            hud_rent = hud_reference_rent(profile, row.get("Beds"))
-            if hud_rent > 0 and row.get("Price"):
-                purchase = float(row.get("Price") or 0)
-                taxes = purchase * float(finance.get("tax_rate_pct", 2.3) or 0) / 100
+            hud_rent = finite_num(hud_reference_rent(profile, row.get("Beds")), 0.0) or 0.0
+            purchase = finite_num(row.get("Price"), 0.0) or 0.0
+
+            if hud_rent > 0 and purchase > 0:
+                tax_rate = finite_num(finance.get("tax_rate_pct", 2.3), 2.3) or 0.0
+                taxes = purchase * tax_rate / 100
+                payment_standard = finite_num(finance.get("payment_standard_pct", 100), 100.0) or 100.0
+                utility_allowance = finite_num(finance.get("utility_allowance", 0), 0.0) or 0.0
+                modeled_rent = max(hud_rent * payment_standard / 100 - utility_allowance, 0)
+
                 model = rental_buy_hold_model(
                     purchase,
-                    max(hud_rent * float(finance.get("payment_standard_pct", 100) or 100) / 100 - float(finance.get("utility_allowance", 0) or 0), 0),
-                    float(finance.get("rehab", 0) or 0),
-                    float(finance.get("closing_pct", 2.0) or 0),
-                    float(finance.get("down_pct", 20.0) or 0),
-                    float(finance.get("rate_pct", 7.5) or 0),
-                    int(finance.get("term_years", 30) or 30),
+                    modeled_rent,
+                    finite_num(finance.get("rehab", 0), 0.0) or 0.0,
+                    finite_num(finance.get("closing_pct", 2.0), 2.0) or 0.0,
+                    finite_num(finance.get("down_pct", 20.0), 20.0) or 0.0,
+                    finite_num(finance.get("rate_pct", 7.5), 7.5) or 0.0,
+                    int(finite_num(finance.get("term_years", 30), 30) or 30),
                     taxes,
-                    float(finance.get("annual_insurance", 3000) or 0),
-                    float(row.get("HOA / mo") or 0),
-                    float(finance.get("vacancy_pct", 5.0) or 0),
-                    float(finance.get("management_pct", 8.0) or 0),
-                    float(finance.get("maintenance_pct", 5.0) or 0),
-                    float(finance.get("capex_pct", 5.0) or 0),
+                    finite_num(finance.get("annual_insurance", 3000), 3000.0) or 0.0,
+                    finite_num(row.get("HOA / mo"), 0.0) or 0.0,
+                    finite_num(finance.get("vacancy_pct", 5.0), 5.0) or 0.0,
+                    finite_num(finance.get("management_pct", 8.0), 8.0) or 0.0,
+                    finite_num(finance.get("maintenance_pct", 5.0), 5.0) or 0.0,
+                    finite_num(finance.get("capex_pct", 5.0), 5.0) or 0.0,
                     0,
                 )
-                cf = model.get("cash_flow")
-                score += max(min(float(cf or 0) / 20, 25), -30)
+                cf = finite_num(model.get("cash_flow"))
+                if cf is not None:
+                    score += max(min(cf / 20, 25), -30)
                 note_parts.append(f"HUD ref {money(hud_rent)}/mo")
-        hud_rents.append(hud_rent if hud_rent else None)
+
+        hud_rents.append(hud_rent if hud_rent > 0 else None)
         s8_cf.append(cf)
-        scores.append(max(min(round(score), 100), 0))
+
+        # A malformed/partial external row should never take down the whole map.
+        if not math.isfinite(score):
+            score = 45.0
+            note_parts.append("Incomplete source data")
+        scores.append(int(max(min(round(score), 100), 0)))
         notes.append(" · ".join(note_parts) if note_parts else "Review price, condition and comps")
+
     out["Screen Score"] = scores
     out["Why it surfaced"] = notes
     if strategy == "Section 8":
@@ -2849,7 +2880,7 @@ def history_df(data):
                 })
     return pd.DataFrame(rows).sort_values("Period") if rows else pd.DataFrame()
 
-st.markdown('<div class="k">NORVIM 13 LLC</div><div class="t">DealFinder 2.5.2</div><div class="s">Automatic Analysis → active Area Scout + free Off-Market Map → cache-first or 0-call underwriting → pipeline.</div>', unsafe_allow_html=True)
+st.markdown('<div class="k">NORVIM 13 LLC</div><div class="t">DealFinder 2.5.3</div><div class="s">Automatic Analysis → active Area Scout + free Off-Market Map → cache-first or 0-call underwriting → pipeline.</div>', unsafe_allow_html=True)
 
 
 app_access_code = str(get_setting("APP_ACCESS_CODE", "") or "").strip()
@@ -5264,4 +5295,4 @@ with tabs[14]:
             st.caption("No saved pipeline records yet.")
 
 
-st.caption("NORVIM DealFinder 2.5.2 · active + off-market scouting · HUD diagnostics · cache-first automatic analysis + 0-call Manual / Free Mode · strategy matching · neighborhood intelligence · CRM.")
+st.caption("NORVIM DealFinder 2.5.3 · active + off-market scouting · HUD diagnostics · cache-first automatic analysis + 0-call Manual / Free Mode · strategy matching · neighborhood intelligence · CRM.")
