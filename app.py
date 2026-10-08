@@ -15,7 +15,12 @@ HCAD_PARCEL_URL = "https://www.gis.hctx.net/arcgis/rest/services/HCAD/Parcels/Ma
 NCES_SCHOOLS_URL = "https://nces.ed.gov/opengis/rest/services/K12_School_Locations/EDGE_GEOCODE_PUBLICSCH_2425/MapServer/0/query"
 HUD_FMR_API_BASE = "https://www.huduser.gov/hudapi/public/fmr"
 
-st.set_page_config(page_title="NORVIM DealFinder 2.7", page_icon="🏠", layout="wide")
+st.set_page_config(page_title="NORVIM DealFinder 2.7.2", page_icon="🏠", layout="wide")
+
+# Safe defaults used by both Automatic and Manual / Free Mode.
+# These must exist before any conditional rendering references them.
+comp_arv_result = {}
+norvim_comp_arv_value = None
 st.markdown("""
 <style>
 :root { color-scheme: light !important; }
@@ -557,7 +562,7 @@ def db_monthly_api_usage():
 
 def safe_public_get(url, params=None, timeout=18):
     try:
-        r = requests.get(url, params=params or {}, timeout=timeout, headers={"User-Agent": "NORVIM-DealFinder/2.7"})
+        r = requests.get(url, params=params or {}, timeout=timeout, headers={"User-Agent": "NORVIM-DealFinder/2.7.1"})
         if not r.ok:
             return {"_error": f"HTTP {r.status_code}"}
         data = r.json()
@@ -3292,7 +3297,7 @@ def history_df(data):
                 })
     return pd.DataFrame(rows).sort_values("Period") if rows else pd.DataFrame()
 
-st.markdown('<div class="k">NORVIM 13 LLC</div><div class="t">DealFinder 2.7</div><div class="s">Automatic Analysis → Area Opportunity Radar + active Area Scout + Off-Market Map + Owner Portfolio → NORVIM Comp ARV → cache-first or 0-call underwriting → pipeline.</div>', unsafe_allow_html=True)
+st.markdown('<div class="k">NORVIM 13 LLC</div><div class="t">DealFinder 2.7.1</div><div class="s">Automatic Analysis → Area Opportunity Radar + active Area Scout + Off-Market Map + Owner Portfolio → NORVIM Comp ARV → cache-first or 0-call underwriting → pipeline.</div>', unsafe_allow_html=True)
 
 
 app_access_code = str(get_setting("APP_ACCESS_CODE", "") or "").strip()
@@ -4659,6 +4664,22 @@ if is_manual_analysis:
 else:
     st.info(f'Quick Scan snapshot: {A.get("quick_fetched_at") or A["time"]} · source: {A.get("cache_source","cache")}. New addresses use ARV + rent only (2 RentCast endpoints); fresh NORVIM-cached addresses use 0.')
 st.warning("Underwriting estimate only. Verify title, condition, flood risk, taxes, liens, repair scope and local comps before contracting.")
+
+# Build the comp-ARV preview before it is referenced in the summary.
+# Manual / Free Mode can have no RentCast comp set, so keep the safe defaults
+# instead of assuming a comparable-sales payload exists.
+_preview_comp_df = comp_df((val or {}).get("comparables") or [])
+if not _preview_comp_df.empty:
+    comp_arv_result = norvim_comp_arv(
+        _preview_comp_df,
+        subj,
+        zip_code if zip_code != "—" else None,
+    ) or {}
+    norvim_comp_arv_value = comp_arv_result.get("estimate")
+else:
+    comp_arv_result = {}
+    norvim_comp_arv_value = None
+
 if norvim_comp_arv_value:
     st.info(
         f"NORVIM Comp ARV: {money(norvim_comp_arv_value)} · {comp_arv_result.get('confidence')} confidence · "
@@ -4703,8 +4724,12 @@ else:
 cdf = cdf_same_zip.copy() if not cdf_same_zip.empty else cdf_all.copy()
 comp_scope_fallback = cdf_same_zip.empty and not cdf_all.empty
 
-comp_arv_result = norvim_comp_arv(cdf_all, subj, zip_code if zip_code != "—" else None)
-norvim_comp_arv_value = comp_arv_result.get("estimate")
+if not cdf_all.empty:
+    comp_arv_result = norvim_comp_arv(cdf_all, subj, zip_code if zip_code != "—" else None) or {}
+    norvim_comp_arv_value = comp_arv_result.get("estimate")
+else:
+    comp_arv_result = {}
+    norvim_comp_arv_value = None
 
 subject_ppsf=(float(arv)/float(subj.get("squareFootage")) if arv and subj.get("squareFootage") else None)
 comp_median_price=median_or_none(cdf,"Price")
