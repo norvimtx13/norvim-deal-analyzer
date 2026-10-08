@@ -7,6 +7,9 @@ import pandas as pd
 import requests
 import streamlit as st
 import pydeck as pdk
+from norvim_fast_exit import prescreen_area
+from norvim_fast_exit_ui import render_fast_exit_dashboard
+from norvim_research_ui import render_research_hub
 
 API_BASE = "https://api.rentcast.io/v1"
 CACHE_TTL_SECONDS = 30 * 24 * 60 * 60  # 30 days
@@ -15,7 +18,7 @@ HCAD_PARCEL_URL = "https://www.gis.hctx.net/arcgis/rest/services/HCAD/Parcels/Ma
 NCES_SCHOOLS_URL = "https://nces.ed.gov/opengis/rest/services/K12_School_Locations/EDGE_GEOCODE_PUBLICSCH_2425/MapServer/0/query"
 HUD_FMR_API_BASE = "https://www.huduser.gov/hudapi/public/fmr"
 
-st.set_page_config(page_title="NORVIM DealFinder 2.7", page_icon="🏠", layout="wide")
+st.set_page_config(page_title="NORVIM DealFinder 2.8", page_icon="🏠", layout="wide")
 st.markdown("""
 <style>
 :root { color-scheme: light !important; }
@@ -1124,7 +1127,26 @@ def get_key():
     return os.getenv("RENTCAST_API_KEY") or st.session_state.get("rentcast_api_key", "")
 
 
+def enforce_api_monthly_budget():
+    """Do not knowingly cross NORVIM's tracked monthly API budget.
+
+    The usage counter excludes requests made outside this app unless accounted for
+    with RENTCAST_USAGE_OFFSET; the provider dashboard is authoritative.
+    """
+    try:
+        allowed = int(float(get_setting("RENTCAST_MONTHLY_LIMIT", 50) or 50))
+    except (TypeError, ValueError):
+        allowed = 50
+    if allowed <= 0 or db_monthly_api_usage() >= allowed:
+        raise RuntimeError(
+            "NORVIM's tracked RentCast monthly budget has been reached. "
+            "Reopen saved research (0 calls) or increase RENTCAST_MONTHLY_LIMIT "
+            "only after checking the official provider dashboard."
+        )
+
+
 def api_get(path, params, key, address_key=None):
+    enforce_api_monthly_budget()
     r = requests.get(f"{API_BASE}{path}", params=params,
                      headers={"Accept":"application/json","X-Api-Key":key}, timeout=30)
     if r.status_code == 401: raise RuntimeError("RentCast rejected the API key.")
@@ -1140,6 +1162,7 @@ def api_get(path, params, key, address_key=None):
 
 def api_get_optional(path, params, key, address_key=None):
     """Same as api_get, but return an empty object if a record simply does not exist."""
+    enforce_api_monthly_budget()
     r = requests.get(
         f"{API_BASE}{path}",
         params=params,
@@ -3292,7 +3315,7 @@ def history_df(data):
                 })
     return pd.DataFrame(rows).sort_values("Period") if rows else pd.DataFrame()
 
-st.markdown('<div class="k">NORVIM 13 LLC</div><div class="t">DealFinder 2.7</div><div class="s">Automatic Analysis → Area Opportunity Radar + active Area Scout + Off-Market Map + Owner Portfolio → NORVIM Comp ARV → cache-first or 0-call underwriting → pipeline.</div>', unsafe_allow_html=True)
+st.markdown('<div class="k">NORVIM 13 LLC</div><div class="t">DealFinder 2.8</div><div class="s">Area Radar → Deal Scout → Fast Exit Deal Desk → Research Hub → Off-Market Map → Full Analyzer → NORVIM portfolio.</div>', unsafe_allow_html=True)
 
 
 app_access_code = str(get_setting("APP_ACCESS_CODE", "") or "").strip()
@@ -3379,10 +3402,10 @@ if "workflow_mode" not in st.session_state:
     st.session_state["workflow_mode"] = "Analyze Property"
 workflow_mode = st.radio(
     "Automatic analysis",
-    ["Analyze Property", "Area Radar", "Find Deals by Area", "Off-Market Map", "Owner Portfolio"],
+    ["Analyze Property", "Area Radar", "Find Deals by Area", "Fast Exit Deal Desk", "Research Hub", "Off-Market Map", "Owner Portfolio"],
     horizontal=True,
     key="workflow_mode",
-    help="Analyze one address, scan free Houston market signals, scan active listings, browse HCAD off-market leads, or search public HCAD parcels by owner name.",
+    help="Analyze houses, scan established Houston areas, validate fast-sale exits, save 50 properties, research comps, and browse off-market owner records.",
 )
 
 
@@ -3644,6 +3667,27 @@ if workflow_mode == "Area Radar":
     else:
         st.info("Choose a lookback and click **Run free market radar**. Leave ZIP blank for a Houston-wide sample or enter ZIPs to compare target areas.")
 
+    st.stop()
+
+if workflow_mode == "Fast Exit Deal Desk":
+    render_fast_exit_dashboard(
+        st, pd,
+        db_get=db_get_cached_snapshot,
+        db_merge=db_merge_save_snapshot,
+        open_callback=open_full_analyzer_from_scout,
+    )
+    st.stop()
+
+if workflow_mode == "Research Hub":
+    render_research_hub(
+        st,
+        db_get=db_get_cached_snapshot,
+        db_merge=db_merge_save_snapshot,
+        get_api_key=get_key,
+        api_call=api_get,
+        usage_fn=db_monthly_api_usage,
+        limit=int(float(get_setting("RENTCAST_MONTHLY_LIMIT", 50) or 50)),
+    )
     st.stop()
 
 if workflow_mode == "Owner Portfolio":
@@ -3926,6 +3970,7 @@ if workflow_mode == "Find Deals by Area":
     with st.container(border=True):
         preset_map = {
             "Custom ZIPs": "",
+            "Established resale targets": "77062, 77070, 77581, 77089, 77084",
             "Sunnyside focus": "77051",
             "Independence Heights focus": "77018, 77022",
             "77022": "77022",
@@ -4042,6 +4087,8 @@ if workflow_mode == "Find Deals by Area":
                 if hud_errors:
                     st.warning("HUD validation found an issue for one or more ZIPs: " + " | ".join([f"{z}: {err}" for z, err in hud_errors.items()]))
             scored = score_area_candidates(combined, scout_strategy, hud_profiles, scout_finance)
+            if scout_strategy == "Flip":
+                scored = prescreen_area(scored)  # Prospecting only; closed-sale evidence is assessed separately.
             st.session_state["area_scan_df"] = scored
             st.session_state["area_scan_sources"] = source_notes
             st.session_state["area_scan_strategy"] = scout_strategy
@@ -4056,8 +4103,9 @@ if workflow_mode == "Find Deals by Area":
         strategy_used = st.session_state.get("area_scan_strategy", scout_strategy)
         st.markdown(f"#### Best preliminary candidates · {strategy_used}")
         st.caption(
-            "Screen Score is a triage score from asking $/sf, market time and—when Section 8 is selected—HUD reference-rent cash flow. "
-            "It is not an ARV, appraisal, or recommendation to buy. Deep-underwrite the property before making an offer."
+            "Screen Score is an acquisition-lead ranking, NOT verified resale velocity. "
+            "A long ACTIVE listing DOM can help negotiation but does not prove renovated homes sell quickly. "
+            "Use Fast Exit Deal Desk with genuine closed comps and verified resale times before submitting an offer."
         )
         notes = st.session_state.get("area_scan_sources") or []
         if notes:
@@ -4143,7 +4191,7 @@ if workflow_mode == "Find Deals by Area":
                 pass
             st.caption("Map colors show preliminary screening score only: green = stronger screen, amber = middle, red = weaker. Zoom/pan freely and click a price bubble to select that property. This is a screening aid—not a buy recommendation.")
 
-        show_cols = ["Screen Score", "Address", "ZIP", "Price", "Beds", "Baths", "Sq Ft", "$/Sq Ft", "DOM", "Property Type", "Why it surfaced"]
+        show_cols = ["Screen Score", "Liquidity Status", "Address", "ZIP", "Price", "Beds", "Baths", "Sq Ft", "$/Sq Ft", "DOM", "Property Type", "Why it surfaced"]
         if strategy_used == "Section 8":
             show_cols += ["HUD Ref Rent", "Est. S8 Cash Flow"]
         if "HCAD Market Value" in area_df.columns:
@@ -6124,4 +6172,4 @@ with tabs[14]:
             st.caption("No saved pipeline records yet.")
 
 
-st.caption("NORVIM DealFinder 2.6 · active + off-market scouting · HUD diagnostics · cache-first automatic analysis + 0-call Manual / Free Mode · strategy matching · neighborhood intelligence · CRM.")
+st.caption("NORVIM DealFinder 2.8 · active + off-market scouting · HUD diagnostics · cache-first automatic analysis + 0-call Manual / Free Mode · strategy matching · neighborhood intelligence · CRM.")
