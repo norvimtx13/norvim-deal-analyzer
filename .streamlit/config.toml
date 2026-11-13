@@ -1,0 +1,9 @@
+# Optional: merge this theme section into your existing .streamlit/config.toml.
+# Keep all existing server, browser and other settings.
+[theme]
+base = "light"
+primaryColor = "#4D5C3D"
+backgroundColor = "#F5F6F0"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#253128"
+font = "sans serif"

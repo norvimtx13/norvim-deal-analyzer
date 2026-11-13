@@ -1,6 +1,7 @@
 import os
 import re
 import math
+import html
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote, quote_plus
 import pandas as pd
@@ -18,7 +19,7 @@ HCAD_PARCEL_URL = "https://www.gis.hctx.net/arcgis/rest/services/HCAD/Parcels/Ma
 NCES_SCHOOLS_URL = "https://nces.ed.gov/opengis/rest/services/K12_School_Locations/EDGE_GEOCODE_PUBLICSCH_2425/MapServer/0/query"
 HUD_FMR_API_BASE = "https://www.huduser.gov/hudapi/public/fmr"
 
-st.set_page_config(page_title="NORVIM DealFinder 2.8", page_icon="🏠", layout="wide")
+st.set_page_config(page_title="NORVIM · Acquisition Workspace", page_icon="🏠", layout="wide", initial_sidebar_state="expanded")
 st.markdown("""
 <style>
 :root { color-scheme: light !important; }
@@ -182,6 +183,108 @@ button[data-baseweb="tab"][aria-selected="true"] { color:#252A24 !important; }
 """, unsafe_allow_html=True)
 
 
+# Workspace presentation only; provider and persistence logic remains intact.
+st.markdown(
+    r"""<style>
+/* NORVIM workspace: cream canvas, olive navigation, quiet white panels. */
+:root{--nv-canvas:#f5f6f0;--nv-paper:#ffffff;--nv-olive:#4d5c3d;--nv-ink:#253128;--nv-muted:#818b76;--nv-line:#e2e5da;color-scheme:light!important}
+html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stMain"]{background:var(--nv-canvas)!important;color:var(--nv-ink)!important}
+html,body,.stApp{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+[data-testid="stHeader"]{background:rgba(245,246,240,.96)!important;border-bottom:1px solid var(--nv-line)}
+[data-testid="stSidebar"]{background:#f9faf5!important;border-right:1px solid var(--nv-line)}
+[data-testid="stSidebar"]>div:first-child{padding-top:1.4rem}
+[data-testid="stSidebar"] .stMarkdown p,[data-testid="stSidebar"] .stCaptionContainer p{color:#819071!important}
+[data-testid="stMainBlockContainer"],.block-container{padding-top:1.8rem;padding-bottom:2rem;max-width:1680px}
+h1,h2,h3{color:var(--nv-ink)!important;letter-spacing:-.025em}
+h1,.nv-hero h1{font-family:Georgia,"Times New Roman",serif!important;font-size:clamp(1.9rem,3vw,2.55rem)!important;line-height:1.18!important;font-weight:400!important;letter-spacing:-.035em!important}
+h2{font-family:Georgia,"Times New Roman",serif!important;font-size:1.8rem!important;font-weight:400!important}
+h3{font-size:1.25rem!important;font-weight:500!important}
+.stMarkdown p,[data-testid="stWidgetLabel"] p{color:#6e7e60!important;line-height:1.65}
+.stCaptionContainer p{color:#94a087!important;font-size:.78rem!important;line-height:1.6}
+.nv-brand{display:flex;gap:11px;align-items:center;margin:2px 0 24px;color:#243129}
+.nv-brand-mark{width:38px;height:42px;border-radius:3px;background:#4d5c3d;color:#f4f5e8;font:32px Georgia,serif;text-align:center;line-height:41px;position:relative}
+.nv-brand-mark:after{content:"";position:absolute;height:1px;width:23px;background:#c5d4a3;bottom:7px;left:7px}
+.nv-brand-name{font-size:20px;font-weight:650;letter-spacing:3px;line-height:1.2}
+.nv-brand-sub{font-size:8px;letter-spacing:3.5px;color:#8c987e;margin-top:5px}
+.nv-company{padding:14px 13px;border:1px solid var(--nv-line);border-radius:6px;background:#fff;margin-bottom:23px;font-size:12px;color:#526545;line-height:1.6}
+.nv-company strong{color:#31432a;font-size:12px}.nv-company span{display:block;font-size:10px;color:#97a28b}
+.nv-nav-label{font-size:9px;font-weight:550;letter-spacing:1.8px;color:#a2aa97;margin-bottom:12px}
+[data-testid="stSidebar"] [data-testid="stRadio"] label{cursor:pointer}
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"]{gap:5px!important}
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"]>label{border-radius:5px;padding:11px 12px;margin:0!important;min-height:42px;background:transparent;transition:background .15s}
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"]>label:hover{background:#eff2e8}
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"]>label:has(input:checked){background:#e7ecde}
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"]>label:has(input:checked) p{color:#3d552d!important;font-weight:650}
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"]>label>div:first-child{display:none}
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"]>label p{font-size:12px;color:#7a8870!important;line-height:1.4}
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"]>label:focus-within{outline:2px solid #a9bf8f;outline-offset:2px}
+.nv-sidebar-note{margin:21px 0;padding:20px 4px 4px;border-top:1px solid var(--nv-line)}
+.nv-sidebar-note b{font:18px/1.5 Georgia,serif;color:#506842;font-weight:400}.nv-sidebar-note p{font-size:11px!important;color:#99a48c!important;margin-top:10px}
+.nv-topbar{display:flex;justify-content:space-between;align-items:center;gap:18px;border-bottom:1px solid var(--nv-line);padding:0 0 18px;margin-bottom:20px;color:#94a087;font-size:11px}
+.nv-breadcrumb{display:flex;align-items:center;gap:13px}.nv-breadcrumb strong{color:#657b53;font-size:11px;font-weight:550}.nv-topbar-right{display:flex;gap:14px;align-items:center;color:#8a9a7a;font-size:10px}.nv-avatar{background:#e6ebdd;color:#6c8058;border-radius:50%;width:29px;height:29px;display:grid;place-items:center;font-size:10px}
+.nv-banner{display:flex;align-items:center;gap:9px;background:#edf1e6;border:1px solid #e0e7d5;border-radius:5px;padding:11px 14px;margin:0 0 27px;color:#8b9c76;font-size:11px;line-height:1.6}.nv-dot{width:6px;height:6px;border-radius:50%;background:#95ab79;display:inline-block;flex-shrink:0}.nv-banner strong{font-weight:550;color:#728961}.nv-banner .nv-banner-right{margin-left:auto;font-size:10px;color:#9ca88f}
+.nv-hero{margin:0 0 25px}.nv-eyebrow{font-size:9px;font-weight:650;letter-spacing:1.8px;color:#7d9169;margin-bottom:12px}.nv-hero h1{margin:0 0 12px}.nv-hero p{font-size:12px;color:#98a28b!important;margin-bottom:0;line-height:1.7}
+.stTextInput input,.stNumberInput input,.stTextArea textarea,[data-baseweb="select"]>div{background:#fff!important;color:var(--nv-ink)!important;border-color:#dfe4d5!important;border-radius:6px!important;font-size:13px!important}
+.stTextInput input:focus,.stNumberInput input:focus,.stTextArea textarea:focus{border-color:#96ad77!important;box-shadow:0 0 0 1px #b8caa3!important}
+[data-testid="stWidgetLabel"] p{font-size:12px!important;color:#7b8d6b!important}
+.stButton button,.stFormSubmitButton button,.stDownloadButton button,.stLinkButton a{border-radius:6px!important;min-height:40px!important;padding:8px 15px!important;font-size:12px!important;font-weight:550!important;box-shadow:none!important}
+.stButton button[kind="primary"],.stFormSubmitButton button[kind="primaryFormSubmit"],.stFormSubmitButton button[kind="primary"]{background:#4d5c3d!important;border:1px solid #4d5c3d!important;color:white!important}
+.stButton button[kind="secondary"],.stFormSubmitButton button[kind="secondaryFormSubmit"],.stDownloadButton button,.stLinkButton a{background:white!important;border:1px solid #dce2d2!important;color:#61794e!important}
+.stButton button:hover,.stFormSubmitButton button:hover,.stDownloadButton button:hover,.stLinkButton a:hover{border-color:#98ab83!important;filter:brightness(.98)}
+.stButton button p,.stFormSubmitButton button p,.stDownloadButton button p{color:inherit!important;font-size:12px!important}
+[data-testid="stVerticalBlockBorderWrapper"]>div,[data-testid="stForm"]{border-color:#e0e5d7!important;border-radius:8px!important;background:#fcfdf9!important}
+[data-testid="stExpander"]{border:1px solid #e0e5d7!important;border-radius:7px!important;background:#fdfefa!important}
+[data-testid="stExpander"] summary{font-size:12px!important;color:#7e916c!important}
+button[data-baseweb="tab"]{color:#8e9e7e!important;font-size:12px!important;padding:10px 13px!important;background:transparent!important}
+button[data-baseweb="tab"][aria-selected="true"]{color:#4d5c3d!important;font-weight:650!important}
+[data-baseweb="tab-highlight"]{background:#4d5c3d!important;height:2px!important}[data-baseweb="tab-border"]{background:#e0e5d7!important;height:1px!important}
+[data-testid="stDataFrame"],[data-testid="stTable"]{border:1px solid var(--nv-line);border-radius:7px;overflow:hidden;background:#fff!important}
+[data-testid="stMetric"]{padding:20px;background:#fff;border:1px solid var(--nv-line);border-radius:7px}
+[data-testid="stMetricValue"]{font-family:Georgia,serif;font-weight:400;color:#38532b!important}
+.norvim-card{background:#fff!important;border:1px solid var(--nv-line)!important;border-radius:7px!important;padding:20px!important;min-height:117px!important;box-shadow:none!important}
+.norvim-card .label{font-size:12px!important;font-weight:450!important;color:#8b9b7c!important;margin-bottom:12px!important}
+.norvim-card .value{font-family:Georgia,serif;font-size:1.9rem!important;font-weight:400!important;letter-spacing:-.035em;color:#2b3c27!important}
+.norvim-card .sub{font-size:10px!important;line-height:1.65!important;color:#9eaa92!important;margin-top:9px!important}
+.friendly-status,.action-card,.strategy-card{background:#fff!important;border-color:var(--nv-line)!important;border-radius:8px!important;box-shadow:none!important}
+.friendly-status.good{background:#edf3e6!important;border-color:#d9e5ca!important}.friendly-status.warn{background:#f7f2e4!important;border-color:#e7dcc0!important}.friendly-status.bad{background:#f8ede6!important;border-color:#ead5c8!important}
+.friendly-status .headline{font-weight:400!important;font-family:Georgia,serif;font-size:1.65rem!important}.friendly-status .body,.action-card .copy{font-size:13px!important;color:#839575!important;line-height:1.75!important}
+.explain-box{background:#eef3e7!important;border-left:3px solid #8ea775!important;border-radius:5px!important;color:#81966e!important;font-size:12px}
+.map-legend{border-radius:6px!important;border-color:var(--nv-line)!important;background:#fff!important;padding:12px 14px!important;gap:16px!important}.map-legend-item{font-size:11px!important;color:#839773!important}
+[data-testid="stDeckGlJsonChart"]{border:1px solid #dce4d1;border-radius:8px;overflow:hidden}
+hr{border-color:var(--nv-line)!important}
+/* Newer Streamlit radio markup; retain the older BaseWeb selectors above. */
+@media(min-width:768px){[data-testid="stSidebar"]{width:240px!important;min-width:240px!important;max-width:240px!important}}
+[data-testid="stMainBlockContainer"],.block-container{padding-left:2rem!important;padding-right:2rem!important}
+[data-testid="stSidebar"] div:has(>[data-testid="stRadioOption"]){width:100%!important;align-self:stretch!important}
+
+[data-testid="stSidebar"] .nv-brand-mark{color:#f4f5e8!important}
+[data-testid="stSidebar"] .nv-brand-sub{color:#8c987e!important}
+[data-testid="stSidebar"] .nv-nav-label{color:#a2aa97!important}
+[data-testid="stSidebar"] .nv-company strong{color:#31432a!important}
+[data-testid="stSidebar"] .nv-company span{color:#97a28b!important}
+[data-testid="stSidebar"] .nv-sidebar-note b{color:#506842!important}
+[data-testid="stSidebar"] [data-testid="stRadioOption"]{position:relative;display:flex!important;box-sizing:border-box;width:100%;min-height:42px;padding:11px 12px 11px 34px!important;border-radius:5px;cursor:pointer;margin:3px 0!important}
+[data-testid="stSidebar"] [data-testid="stRadioOption"]:hover{background:#eff2e8!important}
+[data-testid="stSidebar"] [data-testid="stRadioOption"][data-selected="true"],[data-testid="stSidebar"] [data-testid="stRadioOption"]:has(input:checked){background:#e7ecde!important}
+[data-testid="stSidebar"] [data-testid="stRadioOption"]>div>div:first-child{display:none!important}
+[data-testid="stSidebar"] [data-testid="stRadioOption"] p{font-size:12px!important;line-height:1.4!important;color:#7a8870!important}
+[data-testid="stSidebar"] [data-testid="stRadioOption"][data-selected="true"] p,[data-testid="stSidebar"] [data-testid="stRadioOption"]:has(input:checked) p{color:#3d552d!important;font-weight:650!important}
+[data-testid="stSidebar"] [data-testid="stRadioOption"]:focus-within{outline:2px solid #a9bf8f;outline-offset:2px}
+[data-testid="stSidebar"] [data-testid="stRadioOption"]:before{position:absolute;left:12px;top:9px;font-size:17px;color:#83966f!important;line-height:24px}
+[data-testid="stSidebar"] [data-testid="stRadioOption"]:has(input[value="0"]):before{content:"⌂"}
+[data-testid="stSidebar"] [data-testid="stRadioOption"]:has(input[value="1"]):before{content:"↗"}
+[data-testid="stSidebar"] [data-testid="stRadioOption"]:has(input[value="2"]):before{content:"▦"}
+[data-testid="stSidebar"] [data-testid="stRadioOption"]:has(input[value="3"]):before{content:"↗"}
+[data-testid="stSidebar"] [data-testid="stRadioOption"]:has(input[value="4"]):before{content:"⌕"}
+[data-testid="stSidebar"] [data-testid="stRadioOption"]:has(input[value="5"]):before{content:"◇"}
+[data-testid="stSidebar"] [data-testid="stRadioOption"]:has(input[value="6"]):before{content:"▥"}
+@media(max-width:760px){.block-container,[data-testid="stMainBlockContainer"]{padding:1.2rem 1rem 2rem!important}.nv-hero h1{font-size:1.95rem!important}.nv-topbar{font-size:10px;gap:8px}.nv-topbar-right{font-size:9px;gap:8px}.nv-banner .nv-banner-right{display:none}.nv-banner{font-size:10px}.norvim-card{padding:16px!important;min-height:105px!important}.norvim-card .value{font-size:1.65rem!important}.nv-hero p{font-size:12px!important}[data-testid="stHorizontalBlock"]{gap:.8rem!important}}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
 def money(v):
     try: return f"${float(v):,.0f}"
     except: return "—"
@@ -253,6 +356,131 @@ def get_setting(name, default=None):
     except Exception:
         pass
     return os.getenv(name, default)
+
+
+# Map rendering only: reuse the existing coordinates, layers and provider calls.
+NORVIM_MAPBOX_STYLES = {
+    "Light": "mapbox://styles/mapbox/light-v11",
+    "Streets": "mapbox://styles/mapbox/streets-v12",
+    "Satellite": "mapbox://styles/mapbox/satellite-v9",
+    "Satellite + streets": "mapbox://styles/mapbox/satellite-streets-v12",
+    "Outdoors": "mapbox://styles/mapbox/outdoors-v12",
+}
+NORVIM_FREE_MAP_STYLE = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"
+
+
+def get_mapbox_token():
+    """Only a public token may be passed into a browser-rendered map."""
+    for name in ("MAPBOX_ACCESS_TOKEN", "MAPBOX_API_KEY", "MAPBOX_TOKEN"):
+        token = str(get_setting(name, "") or "").strip()
+        if token.startswith("pk."):
+            return token
+    return ""
+
+
+def norvim_map_options():
+    """One basemap policy for every map; no property/geocoding API requests."""
+    token = get_mapbox_token()
+    provider = st.session_state.get("norvim_map_provider", "Mapbox" if token else "Free map (Carto)")
+    if token and provider == "Mapbox":
+        style = NORVIM_MAPBOX_STYLES.get(st.session_state.get("norvim_map_style", "Light"))
+        custom = str(get_setting("MAPBOX_STYLE", "") or "").strip()
+        if st.session_state.get("norvim_map_style") == "Custom style" and re.fullmatch(r"mapbox://styles/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+", custom):
+            style = custom
+        return {
+            "map_provider": "mapbox",
+            "map_style": style or NORVIM_MAPBOX_STYLES["Light"],
+            "api_keys": {"mapbox": token},
+        }
+    return {"map_provider": "carto", "map_style": NORVIM_FREE_MAP_STYLE}
+
+
+def render_norvim_map_controls():
+    """Shared controls for area, off-market, owner, subject and comparable maps."""
+    token = get_mapbox_token()
+    with st.expander("Map appearance", expanded=False):
+        providers = ["Mapbox", "Free map (Carto)"] if token else ["Free map (Carto)"]
+        if st.session_state.get("norvim_map_provider") not in providers:
+            st.session_state["norvim_map_provider"] = providers[0]
+        provider = st.selectbox("Basemap provider", providers, key="norvim_map_provider")
+        styles = list(NORVIM_MAPBOX_STYLES)
+        custom = str(get_setting("MAPBOX_STYLE", "") or "").strip()
+        if re.fullmatch(r"mapbox://styles/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+", custom):
+            styles.append("Custom style")
+        if st.session_state.get("norvim_map_style") not in styles:
+            st.session_state["norvim_map_style"] = "Light"
+        st.selectbox("Mapbox style", styles, key="norvim_map_style", disabled=provider != "Mapbox")
+        if token:
+            st.caption("Mapbox public token configured. Pan, zoom and select property markers on the maps. No extra RentCast requests are made by these appearance controls.")
+        else:
+            has_secret_token = any(str(get_setting(name, "") or "").strip().startswith("sk.") for name in ("MAPBOX_ACCESS_TOKEN", "MAPBOX_API_KEY", "MAPBOX_TOKEN"))
+            if has_secret_token:
+                st.warning("The configured Mapbox token is a secret token. Use a public pk. token for browser maps; the secret token has not been sent to the map.")
+            st.caption("Free maps stay available. To enable Mapbox, add MAPBOX_ACCESS_TOKEN to Streamlit Secrets using your own public pk. token.")
+            st.code('MAPBOX_ACCESS_TOKEN = "pk.YOUR_PUBLIC_TOKEN"', language="toml")
+        st.caption("Mapbox map loads use your Mapbox account. Existing property-data caching and usage limits are unchanged.")
+
+
+def render_norvim_points_map(points, key="norvim_points_map"):
+    """Replace the simple sales-comps map with the same selectable basemap family."""
+    frame = pd.DataFrame(points).copy()
+    if frame.empty or not {"lat", "lon"}.issubset(frame.columns):
+        st.info("No valid map coordinates are available.")
+        return
+    frame["lat"] = pd.to_numeric(frame["lat"], errors="coerce")
+    frame["lon"] = pd.to_numeric(frame["lon"], errors="coerce")
+    frame = frame[frame["lat"].between(-90, 90) & frame["lon"].between(-180, 180)].copy()
+    if frame.empty:
+        st.info("No valid map coordinates are available.")
+        return
+    layer = pdk.Layer(
+        "ScatterplotLayer", id="norvim-sales-comparison-points", data=frame,
+        get_position="[lon, lat]", get_radius=65,
+        radius_min_pixels=6, radius_max_pixels=14,
+        get_fill_color=[77, 92, 61, 220], get_line_color=[255, 255, 255, 230],
+        stroked=True, line_width_min_pixels=1, pickable=True, auto_highlight=True,
+    )
+    st.pydeck_chart(
+        pdk.Deck(
+            layers=[layer],
+            initial_view_state=pdk.ViewState(latitude=float(frame["lat"].mean()), longitude=float(frame["lon"].mean()), zoom=13.0, pitch=0, controller=True),
+            tooltip={"text": "Latitude: {lat}\nLongitude: {lon}"},
+            **norvim_map_options(),
+        ),
+        use_container_width=True, height=500, key=key,
+    )
+
+
+NORVIM_WORKFLOW_LABELS = {
+    "Analyze Property": "Deal analyzer",
+    "Area Radar": "Market radar",
+    "Find Deals by Area": "Deal room",
+    "Fast Exit Deal Desk": "Fast exit desk",
+    "Research Hub": "Research desk",
+    "Off-Market Map": "Off-market map",
+    "Owner Portfolio": "Owner portfolio",
+}
+
+
+def render_norvim_workspace_header(workflow):
+    label = html.escape(NORVIM_WORKFLOW_LABELS.get(workflow, workflow))
+    headings = {
+        "Analyze Property": ("SOURCE. UNDERWRITE. ACQUIRE.", "Your next move, in focus.", "Keep your data connections. Get a clearer view of every opportunity."),
+        "Area Radar": ("MARKET CONTEXT BEFORE COMMITMENT", "See where opportunity is moving.", "Compare public-record activity, development signals and deal supply."),
+        "Find Deals by Area": ("YOUR OPPORTUNITY BOARD", "Find the deals worth a closer look.", "Screen properties by area, price and strategy using your connected data."),
+        "Fast Exit Deal Desk": ("A CLEARER VIEW OF THE EXIT", "Know the market before the offer.", "Review comparable evidence and resale speed with your existing Fast Exit tools."),
+        "Research Hub": ("YOUR ACQUISITION RESEARCH DESK", "The evidence behind your next move.", "Research property and market details through your existing research workflow."),
+        "Off-Market Map": ("LOOK BEYOND THE LISTINGS", "Put off-market opportunities in focus.", "Explore public-record leads and review the details before outreach."),
+        "Owner Portfolio": ("CONNECT THE PROPERTY RECORDS", "A clearer view of ownership.", "Inspect owner portfolio matches using your current public-data connections."),
+    }
+    eyebrow, title, description = headings.get(workflow, headings["Analyze Property"])
+    st.markdown(
+        f'<div class="nv-topbar"><div class="nv-breadcrumb">Workspace <span>›</span><strong>{label}</strong></div>'
+        '<div class="nv-topbar-right"><span class="nv-dot"></span>NORVIM workspace<span class="nv-avatar">CS</span></div></div>'
+        '<div class="nv-banner"><span class="nv-dot"></span><strong>Your acquisition workspace</strong><span class="nv-banner-right">Facts first. Assumptions visible.</span></div>'
+        f'<div class="nv-hero"><div class="nv-eyebrow">{html.escape(eyebrow)}</div><h1>{html.escape(title)}</h1><p>{html.escape(description)}</p></div>',
+        unsafe_allow_html=True,
+    )
 
 
 def utc_now_iso():
@@ -2265,7 +2493,7 @@ def render_neighborhood_map(map_df, subject_lat=None, subject_lon=None):
     deck = pdk.Deck(
         layers=layers,
         initial_view_state=view_state,
-        map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+        **norvim_map_options(),
         tooltip=tooltip,
     )
 
@@ -3315,7 +3543,7 @@ def history_df(data):
                 })
     return pd.DataFrame(rows).sort_values("Period") if rows else pd.DataFrame()
 
-st.markdown('<div class="k">NORVIM 13 LLC</div><div class="t">DealFinder 2.8</div><div class="s">Area Radar → Deal Scout → Fast Exit Deal Desk → Research Hub → Off-Market Map → Full Analyzer → NORVIM portfolio.</div>', unsafe_allow_html=True)
+# Workspace title and breadcrumb are rendered after navigation is resolved.
 
 
 app_access_code = str(get_setting("APP_ACCESS_CODE", "") or "").strip()
@@ -3332,37 +3560,52 @@ if app_access_code:
         st.stop()
 
 with st.sidebar:
-    st.subheader("Property data")
-    key = get_key()
-    if not key:
-        entered = st.text_input("RentCast API key", type="password", help="For testing. Use Streamlit Secrets on the live site.")
-        if entered:
-            st.session_state["rentcast_api_key"] = entered
-            key = entered
-    else:
-        st.success("Property-data API connected")
+    st.markdown('<div class="nv-brand"><div class="nv-brand-mark">N</div><div><div class="nv-brand-name">NORVIM</div><div class="nv-brand-sub">ACQUISITIONS</div></div></div><div class="nv-company"><strong>NORVIM LLC</strong><span>Investment workspace</span></div><div class="nv-nav-label">WORKSPACE</div>', unsafe_allow_html=True)
+    if "workflow_mode" not in st.session_state:
+        st.session_state["workflow_mode"] = "Analyze Property"
+    workflow_mode = st.radio(
+        "Workspace navigation",
+        list(NORVIM_WORKFLOW_LABELS),
+        format_func=lambda value: NORVIM_WORKFLOW_LABELS[value],
+        key="workflow_mode",
+        label_visibility="collapsed",
+        help="Your existing analyzer, market radar, deal scouting, research and off-market tools.",
+    )
+    st.markdown('<div class="nv-sidebar-note"><b>Good deals start<br>with better questions.</b><p>Facts first. Assumptions visible.<br>Every opportunity in focus.</p></div>', unsafe_allow_html=True)
+    with st.expander("Connections & usage", expanded=False):
+        st.subheader("Property data")
+        key = get_key()
+        if not key:
+            entered = st.text_input("RentCast API key", type="password", help="For testing. Use Streamlit Secrets on the live site.")
+            if entered:
+                st.session_state["rentcast_api_key"] = entered
+                key = entered
+        else:
+            st.success("Property-data API connected")
 
-    monthly_limit = int(float(get_setting("RENTCAST_MONTHLY_LIMIT", 50) or 50))
-    tracked_usage = db_monthly_api_usage()
-    remaining = max(monthly_limit - tracked_usage, 0)
-    st.markdown(f"**Estimated RentCast remaining:** {remaining} / {monthly_limit}")
-    st.progress(min(max(tracked_usage / monthly_limit if monthly_limit else 0, 0), 1))
-    if remaining >= 2:
-        st.caption(f"At 2 calls per uncached Quick Scan, that is roughly {remaining // 2} new-property scans before optional deep research.")
-    if db_enabled():
-        st.caption("Usage counter is stored in the NORVIM database. It tracks successful requests made by this app plus any configured starting offset.")
-    else:
-        st.caption("Usage counter is session-only until Supabase is connected. Set RENTCAST_USAGE_OFFSET if you already used requests this month.")
-    st.link_button("Open RentCast dashboard", "https://app.rentcast.io/app/api", use_container_width=True)
-    st.caption("Quick Scan uses 2 successful RentCast requests on a new property and 0 when the NORVIM cache is fresh. Property record, listing, ZIP market and neighborhood data load only when you request them.")
+        monthly_limit = int(float(get_setting("RENTCAST_MONTHLY_LIMIT", 50) or 50))
+        tracked_usage = db_monthly_api_usage()
+        remaining = max(monthly_limit - tracked_usage, 0)
+        st.markdown(f"**Estimated RentCast remaining:** {remaining} / {monthly_limit}")
+        st.progress(min(max(tracked_usage / monthly_limit if monthly_limit else 0, 0), 1))
+        if remaining >= 2:
+            st.caption(f"At 2 calls per uncached Quick Scan, that is roughly {remaining // 2} new-property scans before optional deep research.")
+        if db_enabled():
+            st.caption("Usage counter is stored in the NORVIM database. It tracks successful requests made by this app plus any configured starting offset.")
+        else:
+            st.caption("Usage counter is session-only until Supabase is connected. Set RENTCAST_USAGE_OFFSET if you already used requests this month.")
+        st.link_button("Open RentCast dashboard", "https://app.rentcast.io/app/api", use_container_width=True)
+        st.caption("Quick Scan uses 2 successful RentCast requests on a new property and 0 when the NORVIM cache is fresh. Property record, listing, ZIP market and neighborhood data load only when you request them.")
 
-    st.divider()
-    if db_enabled():
-        st.success("NORVIM database connected")
-        st.caption("Permanent property snapshots, API usage and CRM pipeline are enabled.")
-    else:
-        st.info("Database not connected")
-        st.caption("The app still works. Add Supabase later for permanent caching, CRM history and scaling.")
+        st.divider()
+        if db_enabled():
+            st.success("NORVIM database connected")
+            st.caption("Permanent property snapshots, API usage and CRM pipeline are enabled.")
+        else:
+            st.info("Database not connected")
+            st.caption("The app still works. Add Supabase later for permanent caching, CRM history and scaling.")
+    render_norvim_map_controls()
+
 
 
 # -----------------------------------------------------------------------------
@@ -3398,15 +3641,7 @@ def set_money_widget_value(widget_key, value):
 # -----------------------------------------------------------------------------
 # AUTOMATIC ANALYSIS WORKFLOW
 # -----------------------------------------------------------------------------
-if "workflow_mode" not in st.session_state:
-    st.session_state["workflow_mode"] = "Analyze Property"
-workflow_mode = st.radio(
-    "Automatic analysis",
-    ["Analyze Property", "Area Radar", "Find Deals by Area", "Fast Exit Deal Desk", "Research Hub", "Off-Market Map", "Owner Portfolio"],
-    horizontal=True,
-    key="workflow_mode",
-    help="Analyze houses, scan established Houston areas, validate fast-sale exits, save 50 properties, research comps, and browse off-market owner records.",
-)
+render_norvim_workspace_header(workflow_mode)
 
 
 
@@ -3542,7 +3777,7 @@ if workflow_mode == "Area Radar":
                     pdk.Deck(
                         layers=[heat, dots],
                         initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=10.3 if not radar_zips else 11.5, pitch=0, controller=True),
-                        map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+                        **norvim_map_options(),
                         tooltip={"html":"<b>{Address}</b><br/>ZIP {ZIP}<br/>Ownership change: {Ownership Change}<br/>HCAD market: {Market Text}<br/>Owner: {Owner}<br/><br/><b>Click to select.</b>","style":{"backgroundColor":"#252A24","color":"white"}},
                     ),
                     use_container_width=True,
@@ -3600,7 +3835,7 @@ if workflow_mode == "Area Radar":
                     pdk.Deck(
                         layers=layers,
                         initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=10.2, pitch=0, controller=True),
-                        map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+                        **norvim_map_options(),
                         tooltip={"html":"<b>{Subdivision}</b><br/>Application: {Application}<br/>Status: {Status}<br/>Type: {Type}<br/>Upload: {Upload Date}<br/>Lots: {Lot Count}","style":{"backgroundColor":"#252A24","color":"white"}},
                     ),
                     use_container_width=True,
@@ -3632,7 +3867,7 @@ if workflow_mode == "Area Radar":
                         pdk.Deck(
                             layers=[layer],
                             initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=10.3 if not radar_zips else 11.5, pitch=0, controller=True),
-                            map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+                            **norvim_map_options(),
                             tooltip={"html":"<b>{Address}</b><br/>Owner: {Owner}<br/>Years owned: {Years Owned}<br/>{Occupancy Proxy}<br/>HCAD market: {Market Text}<br/><br/><b>Click to select.</b>","style":{"backgroundColor":"#252A24","color":"white"}},
                         ),
                         use_container_width=True,
@@ -3751,7 +3986,7 @@ if workflow_mode == "Owner Portfolio":
                 pdk.Deck(
                     layers=[owner_layer],
                     initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=9.5, pitch=0, controller=True),
-                    map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+                    **norvim_map_options(),
                     tooltip={"html":"<b>{Address}</b><br/>Owner: {Owner 1}<br/>HCAD market: {Market Text}<br/>Owned: {Years Text}<br/>{Occupancy Proxy}<br/><br/><b>Click to select.</b>","style":{"backgroundColor":"#252A24","color":"white"}},
                 ),
                 use_container_width=True,
@@ -3907,7 +4142,7 @@ if workflow_mode == "Off-Market Map":
                 pdk.Deck(
                     layers=[layer],
                     initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=10.5, pitch=0, controller=True),
-                    map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+                    **norvim_map_options(),
                     tooltip=tooltip,
                 ),
                 use_container_width=True,
@@ -4169,7 +4404,7 @@ if workflow_mode == "Find Deals by Area":
                 pdk.Deck(
                     layers=[deal_layer, price_layer],
                     initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=10.7 if area_map_df["ZIP"].nunique() > 1 else 12.0, pitch=0, controller=True),
-                    map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+                    **norvim_map_options(),
                     tooltip=area_tooltip,
                 ),
                 use_container_width=True,
@@ -4647,6 +4882,26 @@ provider_arv = float(val.get("price") or 0)
 rent_m = float(rent_data.get("rent") or 0)
 zip_code = str(subj.get("zipCode") or market.get("zipCode") or property_record.get("zipCode") or "—")
 
+# Prepare comp context before any summary card or Comp ARV button uses it.
+cdf_all=comp_df(val.get("comparables") or [])
+rdf=rental_comp_df(rent_data.get("comparables") or [])
+
+# Houston-area ZIPs can change materially within a short distance.
+# Default investor comp set is therefore restricted to the subject ZIP.
+if not cdf_all.empty and "ZIP" in cdf_all.columns and zip_code != "—":
+    cdf_same_zip = cdf_all[cdf_all["ZIP"].astype(str) == zip_code].copy()
+else:
+    cdf_same_zip = cdf_all.copy()
+
+# Use same-ZIP comps when available; fall back to all AVM comps only when RentCast
+# did not return any same-ZIP records.
+cdf = cdf_same_zip.copy() if not cdf_same_zip.empty else cdf_all.copy()
+comp_scope_fallback = cdf_same_zip.empty and not cdf_all.empty
+
+comp_arv_result = norvim_comp_arv(cdf_all, subj, zip_code if zip_code != "—" else None)
+norvim_comp_arv_value = comp_arv_result.get("estimate")
+
+
 # Per-property editable underwriting ARV. The provider estimate is preserved separately.
 arv_widget_key = f"setup_underwriting_arv_{A.get('address_key','')}"
 arv = parse_money_input(st.session_state.get(arv_widget_key, provider_arv), provider_arv)
@@ -4721,9 +4976,7 @@ if norvim_comp_arv_value:
 
 tabs=st.tabs(["DealFinder","Property record","Listing","Deal","BRRRR","Sales comps","Neighborhood map","Area market","Rental","Section 8","Export","Strategy Match","Offer Lab","Neighborhood Intel","CRM"])
 
-# Precompute reusable tables from Quick Scan. ZIP market data is optional and loaded separately.
-cdf_all=comp_df(val.get("comparables") or [])
-rdf=rental_comp_df(rent_data.get("comparables") or [])
+# Comparable tables are prepared before the summary; ZIP market data remains optional.
 
 # Reuse one permanent ZIP-market snapshot across every property in that ZIP.
 market_fresh = bool(market) and snapshot_field_fresh(A, "market_fetched_at", 30, value_key="market", fallback_to_time=True)
@@ -4739,20 +4992,6 @@ if not market_fresh:
 sd=market.get("saleData") or {}
 rd=market.get("rentalData") or {}
 
-# Houston-area ZIPs can change materially within a short distance.
-# Default investor comp set is therefore restricted to the subject ZIP.
-if not cdf_all.empty and "ZIP" in cdf_all.columns and zip_code != "—":
-    cdf_same_zip = cdf_all[cdf_all["ZIP"].astype(str) == zip_code].copy()
-else:
-    cdf_same_zip = cdf_all.copy()
-
-# Use same-ZIP comps when available; fall back to all AVM comps only when RentCast
-# did not return any same-ZIP records.
-cdf = cdf_same_zip.copy() if not cdf_same_zip.empty else cdf_all.copy()
-comp_scope_fallback = cdf_same_zip.empty and not cdf_all.empty
-
-comp_arv_result = norvim_comp_arv(cdf_all, subj, zip_code if zip_code != "—" else None)
-norvim_comp_arv_value = comp_arv_result.get("estimate")
 
 subject_ppsf=(float(arv)/float(subj.get("squareFootage")) if arv and subj.get("squareFootage") else None)
 comp_median_price=median_or_none(cdf,"Price")
@@ -5497,7 +5736,7 @@ with tabs[5]:
         if map_rows:
             st.markdown("#### Subject + comp map")
             st.caption("The map includes the subject property when coordinates are available, plus the filtered comparable properties.")
-            st.map(pd.DataFrame(map_rows),use_container_width=True)
+            render_norvim_points_map(map_rows, key="norvim_sales_comps_map")
 
         st.caption(f'Comp context: median distance {comp_median_distance:.2f} mi' if comp_median_distance is not None else "Comp distance unavailable")
         if comp_avg_similarity is not None:
@@ -6118,7 +6357,7 @@ with tabs[14]:
             with c1:
                 lead_status = st.selectbox("Pipeline status", ["New Lead","Researching","Contacted","Follow Up","Offer Sent","Negotiating","Under Contract","Rehab","Listed / Renting","Closed","Dead Lead"])
                 lead_source = st.text_input("Lead source", placeholder="Driving for dollars, wholesaler, referral...")
-                preferred_crm_strategy = st.selectbox("Preferred strategy", ["Flip","Wholesale","BRRRR","Rental"], index=["Flip","Wholesale","BRRRR","Rental"].index(strategy))
+                preferred_crm_strategy = st.selectbox("Preferred strategy", ["Flip","Wholesale","BRRRR","Rental","Section 8"], index=["Flip","Wholesale","BRRRR","Rental","Section 8"].index(strategy))
             with c2:
                 seller_name = st.text_input("Seller / contact name")
                 seller_phone = st.text_input("Phone")
@@ -6172,4 +6411,4 @@ with tabs[14]:
             st.caption("No saved pipeline records yet.")
 
 
-st.caption("NORVIM DealFinder 2.8 · active + off-market scouting · HUD diagnostics · cache-first automatic analysis + 0-call Manual / Free Mode · strategy matching · neighborhood intelligence · CRM.")
+st.caption("NORVIM Acquisition Workspace · active + off-market scouting · HUD diagnostics · cache-first automatic analysis + 0-call Manual / Free Mode · strategy matching · neighborhood intelligence · CRM.")
