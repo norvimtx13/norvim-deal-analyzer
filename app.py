@@ -11,6 +11,7 @@ import pydeck as pdk
 from norvim_fast_exit import prescreen_area
 from norvim_fast_exit_ui import render_fast_exit_dashboard
 from norvim_research_ui import render_research_hub
+from norvim_verification_ui import render_verification_desk, render_verification_panel, prepare_search_verification
 
 API_BASE = "https://api.rentcast.io/v1"
 CACHE_TTL_SECONDS = 30 * 24 * 60 * 60  # 30 days
@@ -457,6 +458,7 @@ NORVIM_WORKFLOW_LABELS = {
     "Find Deals by Area": "Deal room",
     "Fast Exit Deal Desk": "Fast exit desk",
     "Research Hub": "Research desk",
+    "Verification & Foreclosures": "Legal & foreclosure desk",
     "Off-Market Map": "Off-market map",
     "Owner Portfolio": "Owner portfolio",
 }
@@ -469,6 +471,7 @@ def render_norvim_workspace_header(workflow):
         "Area Radar": ("MARKET CONTEXT BEFORE COMMITMENT", "See where opportunity is moving.", "Compare public-record activity, development signals and deal supply."),
         "Find Deals by Area": ("YOUR OPPORTUNITY BOARD", "Find the deals worth a closer look.", "Screen properties by area, price and strategy using your connected data."),
         "Fast Exit Deal Desk": ("A CLEARER VIEW OF THE EXIT", "Know the market before the offer.", "Review comparable evidence and resale speed with your existing Fast Exit tools."),
+        "Verification & Foreclosures": ("PUBLIC RECORDS BEFORE COMMITMENT", "Know what the records support.", "County classification, legal-use questions and sourced foreclosure / tax leads."),
         "Research Hub": ("YOUR ACQUISITION RESEARCH DESK", "The evidence behind your next move.", "Research property and market details through your existing research workflow."),
         "Off-Market Map": ("LOOK BEYOND THE LISTINGS", "Put off-market opportunities in focus.", "Explore public-record leads and review the details before outreach."),
         "Owner Portfolio": ("CONNECT THE PROPERTY RECORDS", "A clearer view of ownership.", "Inspect owner portfolio matches using your current public-data connections."),
@@ -3913,6 +3916,11 @@ if workflow_mode == "Fast Exit Deal Desk":
     )
     st.stop()
 
+if workflow_mode == "Verification & Foreclosures":
+    render_verification_desk(st, db_get=db_get_cached_snapshot, db_merge=db_merge_save_snapshot,
+        get_setting=get_setting, open_callback=open_full_analyzer_from_scout)
+    st.stop()
+
 if workflow_mode == "Research Hub":
     render_research_hub(
         st,
@@ -4767,6 +4775,7 @@ with st.form("address_form"):
             manual_year_input = st.number_input("Year built", 0, 2100, 0, 1, key="manual_free_year")
         with f8:
             manual_type_input = st.selectbox("Property type", ["Single Family", "Townhouse", "Condo", "Multi-Family", "Manufactured"], key="manual_free_type")
+    auto_county_check = st.checkbox("Include free county classification check", value=True, key="nv_auto_county", help="Checks the Harris County parcel by exact address or available coordinates. City approval and other legal checks remain separate. No RentCast or OpenAI call is used for this check.")
     submitted = st.form_submit_button(
         "Run Full Analyzer — 0 RentCast calls" if manual_mode_selected else "Run deal analysis",
         type="primary",
@@ -4792,7 +4801,7 @@ if submitted:
                     year_built=manual_year_input,
                     property_type=manual_type_input,
                 )
-                st.session_state["analysis"] = manual_analysis
+                st.session_state["analysis"] = prepare_search_verification(st, manual_analysis, auto_county_check, db_get_cached_snapshot, db_merge_save_snapshot)
                 st.rerun()
     else:
         # Cache lookup happens before we require an API key or remaining API budget.
@@ -4826,6 +4835,7 @@ if submitted:
                         "manual_mode": False,
                         "cache_source": "NORVIM database · 0 RentCast calls",
                     }
+                    prepare_search_verification(st, st.session_state["analysis"], auto_county_check, db_get_cached_snapshot, db_merge_save_snapshot)
                     st.rerun()
                 elif not key:
                     st.error("No fresh NORVIM cache was found and no RentCast key is connected.")
@@ -4861,6 +4871,7 @@ if submitted:
                         "cache_source": "Quick Scan · ARV + rent only",
                     }
                     db_save_snapshot(address_key, address_clean, fresh_snapshot)
+                    prepare_search_verification(st, st.session_state["analysis"], auto_county_check, db_get_cached_snapshot, db_merge_save_snapshot)
                     st.rerun()
             except Exception as e:
                 msg = str(e)
@@ -4932,6 +4943,12 @@ ceiling, label, note = offer_math(offer_strategy, arv, offer_rent, rehab, closin
 st.subheader(subj.get("formattedAddress") or A["input"])
 bits=[subj.get("propertyType"), f'{subj.get("bedrooms")} bd' if subj.get("bedrooms") is not None else None, f'{subj.get("bathrooms")} ba' if subj.get("bathrooms") is not None else None, f'{subj.get("squareFootage"):,} sf' if isinstance(subj.get("squareFootage"),(int,float)) else None, f'Built {subj.get("yearBuilt")}' if subj.get("yearBuilt") else None]
 st.caption(" · ".join([str(x) for x in bits if x]))
+
+# Source evidence stays beside each search result and separate from underwriting.
+with st.expander("Legal & property verification", expanded=True):
+    render_verification_panel(st, subj.get("formattedAddress") or A["input"],
+        latitude=subj.get("latitude"), longitude=subj.get("longitude"), initial=A.get("verification"),
+        db_get=db_get_cached_snapshot, db_merge=db_merge_save_snapshot, get_setting=get_setting)
 
 area_bits = [
     subj.get("city") or property_record.get("city"),

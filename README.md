@@ -61,3 +61,7 @@ Use `RENTCAST_USAGE_OFFSET` to account for requests made before DealFinder start
 - `.streamlit/secrets.example.toml` — secrets template
 - `supabase_schema.sql` — permanent cache / CRM schema
 - `DEPLOY_V2.md` — deployment instructions
+
+## Property verification and foreclosure-agent test version
+
+The Legal & foreclosure desk adds source-aware checks, a no-cost Elysian reference demo, on-demand OpenAI web research and CSV import from the existing foreclosure collector. The same verification panel appears beside analyzer search results. See [VERIFICATION_AGENT.md](VERIFICATION_AGENT.md) for the test-app setup, secrets, limits and acceptance checks. AI calls are explicit and separately billed; no unattended crawler or scheduled monitoring is enabled.
